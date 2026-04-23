@@ -353,7 +353,7 @@ registerProcessor('ofdm-processor', OfdmProcessor);`;
         }
 
         // EMA state + history buffers for sparklines (60 pts × 500 ms = 30 s window)
-        const STATS_ALPHA = 0.15, HISTORY_LEN = 60, GRAPH_INTERVAL_MS = 500;
+        const STATS_ALPHA = 0.15, HISTORY_LEN = 120, GRAPH_INTERVAL_MS = 500;
         let smoothSnr = null, smoothPhase = null, lastGraphUpdate = 0;
         const snrHistory = [], phaseHistory = [];
         ofdmDemodInstance = createOfdmDemodulator({
