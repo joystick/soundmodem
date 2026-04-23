@@ -315,7 +315,19 @@ async function toggleAudio() {
       if (modemMode === 'ofdm') {
         // OFDM-HF path: AudioWorklet relays samples → main thread OFDM demodulator
         const gpuDftInst = await getGpuDft(); // null if WebGPU unavailable
-        await audioContext.audioWorklet.addModule('/src/ofdm-worklet.js');
+        // Inline the worklet as a Blob URL so the single-file dist works without
+        // a separate /src/ofdm-worklet.js being served alongside index.html.
+        const workletSrc = `class OfdmProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch && ch.length > 0) this.port.postMessage(ch.slice());
+    return true;
+  }
+}
+registerProcessor('ofdm-processor', OfdmProcessor);`;
+        const workletUrl = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
+        await audioContext.audioWorklet.addModule(workletUrl);
+        URL.revokeObjectURL(workletUrl);
         ofdmDemodInstance = createOfdmDemodulator({
           onMessage: receiveMsg,
           onFilePacket: receiveFilePacket,
