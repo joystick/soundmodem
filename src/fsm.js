@@ -8,6 +8,7 @@
 //   initializing    AudioContext + GPU/worklet setup in progress
 //   running         audio active and demodulating
 //   tx              transmitting (speaker busy — RX suspended)
+//   tx-paused       between fragments; speaker idle, chat re-enabled
 //   stopping        teardown in progress
 //   error           unrecoverable hardware failure
 //
@@ -26,6 +27,7 @@ export const S = {
   INITIALIZING:   'initializing',
   RUNNING:        'running',
   TX:             'tx',
+  TX_PAUSED:      'tx-paused',
   STOPPING:       'stopping',
   ERROR:          'error',
 };
@@ -41,6 +43,9 @@ export const E = {
   MODE_CHANGE:    'MODE_CHANGE',
   START_TX:       'START_TX',
   TX_DONE:        'TX_DONE',
+  PAUSE_TX:       'PAUSE_TX',
+  RESUME_TX:      'RESUME_TX',
+  CANCEL_TX:      'CANCEL_TX',
 };
 
 /**
@@ -87,6 +92,17 @@ export function transition(state, event, context = { mode: 'bell202', errorMessa
     case S.TX:
       if (event.type === E.TX_DONE)
         return { state: S.RUNNING, context };
+      if (event.type === E.PAUSE_TX)
+        return { state: S.TX_PAUSED, context };
+      if (event.type === E.STOP)
+        return { state: S.STOPPING, context };
+      break;
+
+    case S.TX_PAUSED:
+      if (event.type === E.RESUME_TX)
+        return { state: S.TX, context };
+      if (event.type === E.CANCEL_TX)
+        return { state: S.RUNNING, context };
       if (event.type === E.STOP)
         return { state: S.STOPPING, context };
       break;
@@ -112,5 +128,6 @@ export function isAudioActive(state) {
       || state === S.INITIALIZING
       || state === S.RUNNING
       || state === S.TX
+      || state === S.TX_PAUSED
       || state === S.STOPPING;
 }
