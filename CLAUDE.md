@@ -2,6 +2,21 @@
 
 Single-file browser app implementing P2P text chat and file transfer over audio using AX.25 UI frames modulated as Bell 202 AFSK. Source lives in `src/` ES modules; `npm run build` produces a self-contained `dist/index.html`.
 
+## Development workflow
+
+```
+idea → PRD (docs/research/) → plan (plans/) → feature branch → TDD → build → test → merge main → deploy
+```
+
+1. **Research / PRD** — write a design doc in `docs/research/<name>.md`
+2. **Plan** — run `/prd-to-plan` to produce `plans/<name>.md` (vertical slices / tracer bullets)
+3. **Branch** — `git checkout -b feature/<name>`
+4. **TDD loop** — run `/tdd`; one RED→GREEN cycle per behaviour using Vitest (unit) + Playwright (integration)
+5. **Build** — `npm run build` → `dist/index.html`
+6. **All tests green** — `npm test && npx playwright test`
+7. **Merge** — `git checkout main && git merge --no-ff feature/<name> && git push origin main`
+8. **Deploy** — `rsync -av dist/index.html vesta03:/home/alexei/web/modem.kipr24.com/public_html/index.html`
+
 ## How to run
 
 ```bash
@@ -17,6 +32,17 @@ python3 -m http.server 8765
 ```
 
 `file://` is blocked by browsers — `getUserMedia` and WebGPU both require a secure context (localhost qualifies).
+
+## Deploy to production
+
+Production URL: **https://modem.kipr24.com**
+
+```bash
+npm run build
+rsync -av dist/index.html vesta03:/home/alexei/web/modem.kipr24.com/public_html/index.html
+```
+
+Server: `vesta03` (SSH alias) — docroot at `/home/alexei/web/modem.kipr24.com/public_html/`.
 
 ## Testing
 
