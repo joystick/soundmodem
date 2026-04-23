@@ -1,0 +1,14 @@
+- generic [active] [ref=e1]:
+  - heading "SoundModem P2P Chat" [level=1] [ref=e2]
+  - generic [ref=e3]:
+    - text: "Callsign (required):"
+    - textbox "Callsign (required):" [ref=e4]:
+      - /placeholder: e.g. TEST01
+  - generic [ref=e5]:
+    - text: "Encryption Passphrase (optional):"
+    - textbox "Encryption Passphrase (optional):" [ref=e6]:
+      - /placeholder: shared secret
+  - button "Start Audio" [ref=e7]
+  - text: Stopped
+  - textbox "Type message..." [ref=e9]
+  - button "Send" [ref=e10]

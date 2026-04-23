@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SoundModem Chat</title>
+  <style>
+    body { font-family: monospace; max-width: 640px; margin: 0 auto; padding: 20px; }
+    #chat { height: 300px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px; background: #f9f9f9; }
+    input, button, select { margin: 5px 0; padding: 8px; font-family: monospace; }
+    #status { color: orange; font-weight: bold; }
+    #demod-mode { font-size: 0.85em; margin-left: 10px; }
+    .tx { color: green; } .rx { color: blue; } .err { color: red; }
+  </style>
+</head>
+<body>
+  <h1>SoundModem P2P Chat</h1>
+  <label>Callsign (required):
+    <input id="callsign" data-testid="callsign-input" placeholder="e.g. TEST01" maxlength="6">
+  </label><br>
+  <label>Encryption Passphrase (optional):
+    <input id="passphrase" data-testid="passphrase-input" type="password" placeholder="shared secret">
+  </label><br>
+  <label>Microphone:
+    <select id="micSelect" data-testid="mic-select"><option value="">Default</option></select>
+  </label><br>
+  <button id="toggleBtn" data-testid="toggle-btn" onclick="toggleAudio()">Start Audio</button>
+  <span id="status" data-testid="status">Stopped</span>
+  <span id="demod-mode" data-testid="demod-mode"></span><br>
+  <div id="chat" data-testid="chat-log"></div>
+  <input id="message" data-testid="message-input" placeholder="Type message..."
+         onkeypress="if(event.key==='Enter') sendMsg()">
+  <button data-testid="send-btn" onclick="sendMsg()">Send</button>
+
+  <script>
+    // ── Bell 202 AFSK constants ────────────────────────────────────────────────
+    const MARK_FREQ   = 1200;    // Logic 1 / no NRZI transition
+    const SPACE_FREQ  = 2200;    // Logic 0 / NRZI transition
+    const SAMPLE_RATE = 44100;
+    const BAUD        = 1200;
+    const SPB         = Math.floor(SAMPLE_RATE / BAUD); // 36 samples per bit
+    const CRC_POLY    = 0x1021;
+
+    // ── DPLL / high-rate estimation constants ──────────────────────────────────
+    // RX uses a sliding Goertzel/discriminator window that advances STEP samples
+    // per estimate — ~9× oversampling of the symbol clock.  The DPLL consumes
+    // these estimates and recovers the exact symbol boundaries.
+    const STEP            = 4;   // samples between successive frequency estimates
+    const PREAMBLE_FLAGS  = 30;  // 0x7E repetitions prepended to every TX frame
+    const POSTAMBLE_FLAGS = 4;   // 0x7E repetitions appended  (flush decoder)
+
+    // ── WebGPU: high-rate parallel Goertzel (Option 2) ────────────────────────
+    // Thread `pos` evaluates squared Goertzel magnitude over the SPB-wide window
+    // starting at sample `pos * STEP`.  One thread per sliding-window position.
+    const GOERTZEL_WGSL = /* wgsl */`
+struct Params {
+  num_samples   : u32,
+  num_positions : u32,
+  step          : u32,
+  spb           : u32,
+  mark_k        : f32,  // MARK_FREQ  * spb / SAMPLE_RATE
+  space_k       : f32,  // SPACE_FREQ * spb / SAMPLE_RATE
+}
+@group(0) @binding(0) var<uniform>             p       : Params;
+@group(0) @binding(1) var<storage, read>       samples : array<f32>;
+@group(0) @binding(2) var<storage, read_write> ismark  : array<u32>;
+
+const TWO_PI : f32 = 6.28318530718;
+
+fn goertzel_sq(off : u32, k : f32) -> f32 {
+  let w = TWO_PI * k / f32(p.spb);
+  var re : f32 = 0.0; var im : f32 = 0.0;
+  for (var i : u32 = 0u; i < p.spb; i++) {
+    let s = samples[off + i];
+    re += s * cos(f32(i) * w);
+    im += s * sin(f32(i) * w);
+  }
+  return re * re + im * im;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+  let pos = id.x;
+  if (pos >= p.num_positions) { return; }
+  let off = pos * p.step;
+  if (off + p.spb > p.num_samples) { ismark[pos] = 1u; return; }
+  ismark[pos] = select(0u, 1u, goertzel_sq(off, p.mark_k) >= goertzel_sq(off, p.space_k));
+}`;
+
+    // ── WebGPU: high-rate FM discriminator (Option 3) ─────────────────────────
+    // Thread `pos` mixes the SPB-wide window at sample `pos * STEP` with a
+    // complex carrier at fc = 1700 Hz, then accumulates the cross-product
+    // discriminant Σ(Q[n]·I[n-1] − I[n]·Q[n-1]).
+    //   disc < 0  →  freq < fc  →  MARK  →  ismark = 1
+    //   disc ≥ 0  →  freq > fc  →  SPACE →  ismark = 0
+    // Phase-invariant; better SNR than Goertzel on noisy VHF channels.
+    const DISCRIMINATOR_WGSL = /* wgsl */`
+struct Params {
+  num_samples      : u32,
+  num_positions    : u32,
+  step             : u32,
+  spb              : u32,
+  center_phase_inc : f32,  // 2π * 1700 / 44100
+}
+@group(0) @binding(0) var<uniform>             p      : Params;
+@group(0) @binding(1) var<storage, read>       samples: array<f32>;
+@group(0) @binding(2) var<storage, read_write> ismark : array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+  let pos = id.x;
+  if (pos >= p.num_positions) { return; }
+  let off = pos * p.step;
+  if (off + p.spb > p.num_samples) { ismark[pos] = 1u; return; }
+  // Need one prior sample for the differential; skip pos 0.
+  if (off == 0u) { ismark[pos] = 1u; return; }
+
+  let pi  = p.center_phase_inc;
+  var I_p = samples[off - 1u] * cos(f32(off - 1u) * pi);
+  var Q_p = samples[off - 1u] * sin(f32(off - 1u) * pi);
+  var disc : f32 = 0.0;
+
+  for (var i : u32 = 0u; i < p.spb; i++) {
+    let n = off + i;
+    let ph = f32(n) * pi;
+    let I  = samples[n] * cos(ph);
+    let Q  = samples[n] * sin(ph);
+    disc  += Q * I_p - I * Q_p;
+    I_p = I; Q_p = Q;
+  }
+  ismark[pos] = select(0u, 1u, disc < 0.0);
+}`;
+
+    // ── GpuDemodulator ────────────────────────────────────────────────────────
+    // Returns a high-rate isMark[] array (one entry per STEP samples).
+    // DPLL and NRZI decode run on the CPU after readback.
+    class GpuDemodulator {
+      constructor(device, mode) {
+        this.device       = device;
+        this.mode         = mode;   // 'goertzel' | 'discriminator'
+        this.MAX_SAMPLES  = 4096;
+        this.MAX_POSITIONS = Math.ceil(this.MAX_SAMPLES / STEP); // 1024
+        this.PARAM_BYTES  = 32;     // multiple of 16 required for uniform buffers
+      }
+
+      init() {
+        const d = this.device;
+        this.paramBuf  = d.createBuffer({ size: this.PARAM_BYTES,        usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
+        this.sampleBuf = d.createBuffer({ size: this.MAX_SAMPLES * 4,    usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_DST });
+        this.ismarkBuf = d.createBuffer({ size: this.MAX_POSITIONS * 4,  usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_SRC });
+        this.readBuf   = d.createBuffer({ size: this.MAX_POSITIONS * 4,  usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+        const src = this.mode === 'discriminator' ? DISCRIMINATOR_WGSL : GOERTZEL_WGSL;
+        const mod = d.createShaderModule({ code: src });
+        const bgl = d.createBindGroupLayout({ entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        ]});
+        this.bindGroup = d.createBindGroup({ layout: bgl, entries: [
+          { binding: 0, resource: { buffer: this.paramBuf } },
+          { binding: 1, resource: { buffer: this.sampleBuf } },
+          { binding: 2, resource: { buffer: this.ismarkBuf } },
+        ]});
+        this.pipeline = d.createComputePipeline({
+          layout:  d.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+          compute: { module: mod, entryPoint: 'main' },
+        });
+      }
+
+      // Returns Uint32Array of isMark values at STEP-sample rate.
+      async processChunk(samples) {
+        const d = this.device;
+        const n = samples.length;
+        const numPos = Math.floor((n - SPB) / STEP) + 1;
+        if (numPos <= 0) return new Uint32Array(0);
+
+        const pv = new DataView(new ArrayBuffer(this.PARAM_BYTES));
+        pv.setUint32( 0, n,      true);
+        pv.setUint32( 4, numPos, true);
+        pv.setUint32( 8, STEP,   true);
+        pv.setUint32(12, SPB,    true);
+        if (this.mode === 'goertzel') {
+          pv.setFloat32(16, MARK_FREQ  * SPB / SAMPLE_RATE, true);
+          pv.setFloat32(20, SPACE_FREQ * SPB / SAMPLE_RATE, true);
+        } else {
+          pv.setFloat32(16, 2 * Math.PI * (MARK_FREQ + SPACE_FREQ) / 2 / SAMPLE_RATE, true);
+        }
+        d.queue.writeBuffer(this.paramBuf,  0, pv.buffer);
+        d.queue.writeBuffer(this.sampleBuf, 0, samples.buffer, samples.byteOffset, n * 4);
+
+        const enc  = d.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, this.bindGroup);
+        pass.dispatchWorkgroups(Math.ceil(numPos / 64));
+        pass.end();
+        enc.copyBufferToBuffer(this.ismarkBuf, 0, this.readBuf, 0, numPos * 4);
+        d.queue.submit([enc.finish()]);
+
+        await this.readBuf.mapAsync(GPUMapMode.READ, 0, numPos * 4);
+        const result = new Uint32Array(this.readBuf.getMappedRange(0, numPos * 4)).slice();
+        this.readBuf.unmap();
+        return result;
+      }
+
+      destroy() {
+        [this.paramBuf, this.sampleBuf, this.ismarkBuf, this.readBuf].forEach(b => b.destroy());
+      }
+    }
+
+    // ── DPLL — Digital Phase-Locked Loop for symbol clock recovery ────────────
+    // Consumes high-rate isMark estimates (one per STEP samples).
+    // Tracks symbol boundaries using frequency transitions as a phase reference.
+    // Emits one NRZI-decoded bit per recovered symbol.
+    //
+    // Loop parameters (tuned for Bell 202 over VHF audio):
+    //   α = 0.05  — phase correction gain  (responds quickly to timing errors)
+    //   β = 0.002 — frequency correction gain (slow drift compensation ±50 ppm)
+    //   ω limits  ±15% of nominal — prevents lock on harmonics
+    class DPLL {
+      constructor() {
+        this.OMEGA_NOM = SPB / STEP; // nominal period = 9.0 steps/symbol
+        this.reset();
+      }
+
+      reset() {
+        this.omega       = this.OMEGA_NOM;
+        this.phase       = 0;
+        this.lastFreq    = true;  // freq at previous step (for transition detect)
+        this.lastSymFreq = true;  // freq at previous symbol boundary (for NRZI)
+        this.snapshot    = true;  // captured freq at symbol start (for bit decision)
+      }
+
+      // Feed one high-rate isMark estimate.
+      // Returns NRZI-decoded bit (0 or 1) at each symbol boundary, else null.
+      feed(isMark) {
+        const prevPhase = this.phase;
+        this.phase += 1;
+
+        // Capture the symbol's frequency at the very first step after phase reset.
+        // At that step the Goertzel window [n*STEP, n*STEP+SPB) is perfectly aligned
+        // with the symbol boundary, giving the cleanest (non-straddling) reading.
+        if (prevPhase < 1) this.snapshot = isMark;
+
+        // Frequency transition → use as phase reference for clock recovery.
+        // With a Goertzel window of SPB samples sampled every STEP samples, transitions
+        // appear at phase ≈ omega/2 + 1.5 (half-window delay + DPLL early-fire offset).
+        if (isMark !== this.lastFreq) {
+          const target = this.omega * 0.5 + 1.5;
+          let err = this.phase - target;
+          if (err >  this.omega / 2) err -= this.omega;
+          if (err < -this.omega / 2) err += this.omega;
+          this.phase -= err * 0.1;                             // α: phase correction
+          this.omega  = Math.max(this.OMEGA_NOM * 0.85,
+                       Math.min(this.OMEGA_NOM * 1.15,
+                       this.omega - err * 0.0002));            // β: freq correction
+        }
+        this.lastFreq = isMark;
+
+        if (this.phase >= this.omega) {
+          this.phase -= this.omega;
+          // NRZI: same frequency as previous symbol = data 1, different = data 0
+          const bit = (this.snapshot === this.lastSymFreq) ? 1 : 0;
+          this.lastSymFreq = this.snapshot;
+          return bit;
+        }
+        return null;
+      }
+    }
+
+    // ── Runtime state ─────────────────────────────────────────────────────────
+    let audioContext, micNode, scriptNode, isRunning = false;
+    let callsign = '', passphrase = '', cryptoKey = null;
+    const chatEl = document.getElementById('chat');
+
+    let sampleBuffer = []; // CPU sliding-window sample accumulator
+    let demodBits    = []; // recovered bits (both paths feed here)
+    const dpll       = new DPLL();
+
+    let gpuDemodulator = null;
+    let gpuQueue       = [];
+    let gpuBusy        = false;
+
+    // ── WebGPU init: discriminator → goertzel → CPU ───────────────────────────
+    async function initWebGpu() {
+      const el = document.getElementById('demod-mode');
+      if (!navigator.gpu) { el.textContent = 'using CPU'; el.style.color = '#b8860b'; return; }
+      try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) throw new Error('no adapter');
+        const device  = await adapter.requestDevice();
+        device.lost.then(info => {
+          gpuDemodulator = null;
+          const dm = document.getElementById('demod-mode');
+          dm.textContent = 'using CPU'; dm.style.color = '#b8860b';
+          addChat(`GPU lost: ${info.message}`, 'err');
+        });
+        for (const mode of ['discriminator', 'goertzel']) {
+          try {
+            const dem = new GpuDemodulator(device, mode);
+            dem.init();
+            gpuDemodulator = dem;
+            el.textContent = `using GPU (${mode === 'discriminator' ? 'FM discriminator' : 'Goertzel'})`;
+            el.style.color = 'green';
+            return;
+          } catch { /* try next mode */ }
+        }
+        throw new Error('all GPU modes failed');
+      } catch (e) {
+        el.textContent = 'using CPU'; el.style.color = '#b8860b';
+      }
+    }
+    initWebGpu();
+
+    // ── Mic device list ────────────────────────────────────────────────────────
+    async function populateMicList() {
+      try {
+        const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+        tmp.getTracks().forEach(t => t.stop());
+        const sel = document.getElementById('micSelect');
+        (await navigator.mediaDevices.enumerateDevices())
+          .filter(d => d.kind === 'audioinput')
+          .forEach(d => {
+            const opt = document.createElement('option');
+            opt.value = d.deviceId; opt.textContent = d.label || d.deviceId;
+            if (d.label.toLowerCase().includes('webcam') || d.label.toLowerCase().includes('general'))
+              opt.selected = true;
+            sel.appendChild(opt);
+          });
+      } catch { /* no permission yet */ }
+    }
+    populateMicList();
+
+    // ── CRC-16-CCITT (init 0xFFFF) ─────────────────────────────────────────────
+    function crc16(data) {
+      let crc = 0xFFFF;
+      for (const b of data) {
+        crc ^= (b << 8);
+        for (let i = 0; i < 8; i++) crc = (crc & 0x8000) ? ((crc << 1) ^ CRC_POLY) : (crc << 1);
+        crc &= 0xFFFF;
+      }
+      return [(crc >> 8) & 0xFF, crc & 0xFF];
+    }
+
+    function bitStuff(bits) {
+      const out = []; let ones = 0;
+      for (const b of bits) {
+        out.push(b); ones = b === 1 ? ones + 1 : 0;
+        if (ones === 5) { out.push(0); ones = 0; }
+      }
+      return out;
+    }
+
+    function encodeCallsign(cs, isLast) {
+      const bytes = cs.toUpperCase().padEnd(6, ' ').split('').map(c => c.charCodeAt(0) << 1);
+      bytes.push(0x60 | (isLast ? 0x01 : 0x00));
+      return bytes;
+    }
+
+    function buildFrame(msg, dst) {
+      const content = [...encodeCallsign(dst, false), ...encodeCallsign(callsign, true),
+                        0x03, 0xF0, ...new TextEncoder().encode(msg)];
+      return [0x7E, ...content, ...crc16(content), 0x7E];
+    }
+
+    // ── AES-GCM encryption ─────────────────────────────────────────────────────
+    async function encryptMsg(msg) {
+      if (!passphrase) return msg;
+      if (!cryptoKey) {
+        const raw = await crypto.subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+        cryptoKey = await crypto.subtle.deriveKey(
+          { name: 'PBKDF2', salt: new Uint8Array(16), iterations: 100000, hash: 'SHA-256' },
+          raw, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+      }
+      const iv  = crypto.getRandomValues(new Uint8Array(12));
+      const enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, new TextEncoder().encode(msg));
+      return btoa(String.fromCharCode(...iv, ...new Uint8Array(enc)));
+    }
+
+    async function decryptMsg(payload) {
+      if (!passphrase || !cryptoKey) return payload;
+      try {
+        const b = Uint8Array.from(atob(payload), c => c.charCodeAt(0));
+        return new TextDecoder().decode(await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: b.slice(0, 12) }, cryptoKey, b.slice(12)));
+      } catch { return '[decrypt failed]'; }
+    }
+
+    // ── Modulator: bytes → AFSK Float32Array ──────────────────────────────────
+    // TX structure: [PREAMBLE_FLAGS × 0x7E] [frame with opening+closing flags] [POSTAMBLE_FLAGS × 0x7E]
+    // Preamble flags give the receiver's DPLL time to lock before data arrives.
+    // Postamble flushes the last bits through the decoder's shift register.
+    function modulate(frameBytes) {
+      const flagBits = [0, 1, 1, 1, 1, 1, 1, 0]; // 0x7E
+
+      // Frame content bits (between the AX.25 opening/closing flags), bit-stuffed
+      const rawBits = [];
+      for (const byte of frameBytes.slice(1, -1))
+        for (let i = 7; i >= 0; i--) rawBits.push((byte >> i) & 1);
+
+      // Flags are exempt from bit stuffing
+      const preamble  = Array.from({ length: PREAMBLE_FLAGS  }, () => flagBits).flat();
+      const postamble = Array.from({ length: POSTAMBLE_FLAGS }, () => flagBits).flat();
+      const bits = [...preamble, ...flagBits, ...bitStuff(rawBits), ...flagBits, ...postamble];
+
+      // NRZI + AFSK synthesis (continuous phase)
+      let freq = MARK_FREQ, phase = 0;
+      const audio = new Float32Array(bits.length * SPB);
+      let idx = 0;
+      for (const bit of bits) {
+        if (bit === 0) freq = (freq === MARK_FREQ) ? SPACE_FREQ : MARK_FREQ;
+        const inc = 2 * Math.PI * freq / SAMPLE_RATE;
+        for (let s = 0; s < SPB; s++) {
+          phase = (phase + inc) % (2 * Math.PI);
+          audio[idx++] = Math.sin(phase);
+        }
+      }
+      return audio;
+    }
+
+    // ── CPU Goertzel (per sliding window, used in CPU fallback path) ───────────
+    function goertzel(samples, freq) {
+      const N = samples.length;
+      const w = 2 * Math.PI * Math.round(freq * N / SAMPLE_RATE) / N;
+      let re = 0, im = 0;
+      for (let i = 0; i < N; i++) { re += samples[i] * Math.cos(i * w); im += samples[i] * Math.sin(i * w); }
+      return Math.sqrt(re * re + im * im) / N;
+    }
+
+    // ── Shared DPLL consumer: takes isMark[] at STEP rate, emits bits ──────────
+    function consumeIsMarkArray(isMarkArr) {
+      for (const m of isMarkArr) {
+        const bit = dpll.feed(m === 1);
+        if (bit !== null) demodBits.push(bit);
+      }
+      if (demodBits.length >= 160) tryDecodeFrame();
+    }
+
+    // ── CPU path: sliding-window Goertzel → DPLL ──────────────────────────────
+    function cpuProcessChunk(inputSamples) {
+      for (const s of inputSamples) sampleBuffer.push(s);
+      // Slide by STEP samples, evaluate over SPB-wide window each time
+      while (sampleBuffer.length >= SPB) {
+        const win    = sampleBuffer.slice(0, SPB);
+        const isMark = goertzel(win, MARK_FREQ) >= goertzel(win, SPACE_FREQ);
+        const bit    = dpll.feed(isMark);
+        if (bit !== null) demodBits.push(bit);
+        sampleBuffer.splice(0, STEP);
+      }
+      if (demodBits.length >= 160) tryDecodeFrame();
+    }
+
+    // ── GPU async queue drain ──────────────────────────────────────────────────
+    async function drainGpuQueue() {
+      gpuBusy = true;
+      while (gpuQueue.length > 0) {
+        const chunk = gpuQueue.shift();
+        consumeIsMarkArray(await gpuDemodulator.processChunk(chunk));
+      }
+      gpuBusy = false;
+    }
+
+    // ── processAudioChunk: routes to GPU or CPU ────────────────────────────────
+    function processAudioChunk(inputSamples) {
+      if (gpuDemodulator) {
+        gpuQueue.push(new Float32Array(inputSamples)); // copy before SP buffer reuse
+        if (!gpuBusy) drainGpuQueue();
+      } else {
+        cpuProcessChunk(inputSamples);
+      }
+    }
+
+    // ── AX.25 frame decoder ────────────────────────────────────────────────────
+    function tryDecodeFrame() {
+      const FLAG      = [0, 1, 1, 1, 1, 1, 1, 0];
+      const matchFlag = pos => FLAG.every((b, j) => demodBits[pos + j] === b);
+      let consumed    = 0;
+
+      for (let i = 0; i + 8 <= demodBits.length; i++) {
+        if (!matchFlag(i)) continue;
+        // Search for a valid closing flag.  Use `continue` (not break) on every
+        // inner failure so false flags inside the data don't abort the search.
+        // Cap the scan at 4096 bits (512 B) to stay O(n) on garbage input.
+        for (let end = i + 64; end + 8 <= demodBits.length && end - i <= 4096; end++) {
+          if (!matchFlag(end)) continue;
+          const frameBits = demodBits.slice(i + 8, end);
+          const destuffed = []; let ones = 0, corrupt = false;
+          for (const b of frameBits) {
+            if (ones === 5) { if (b !== 0) { corrupt = true; break; } ones = 0; continue; }
+            destuffed.push(b); ones = b === 1 ? ones + 1 : 0;
+          }
+          if (corrupt || destuffed.length % 8 !== 0) continue;
+          const bytes = [];
+          for (let k = 0; k < destuffed.length; k += 8) {
+            let byte = 0;
+            for (let j = 0; j < 8; j++) byte = (byte << 1) | destuffed[k + j];
+            bytes.push(byte);
+          }
+          if (bytes.length < 3) continue;
+          const [cH, cL] = bytes.slice(-2), [eH, eL] = crc16(bytes.slice(0, -2));
+          if (cH !== eH || cL !== eL) continue;
+          const msg = new TextDecoder().decode(new Uint8Array(bytes.slice(16, -2)));
+          if (msg) receiveMsg(msg);
+          consumed = end + 8; i = end; break;
+        }
+      }
+      // Keep enough tail to span a full preamble + minimum frame across chunk boundaries
+      demodBits = demodBits.slice(Math.max(consumed, demodBits.length - 800));
+    }
+
+    // ── Send / receive ─────────────────────────────────────────────────────────
+    async function sendMsg() {
+      const msgEl = document.getElementById('message');
+      const msg   = msgEl.value.trim();
+      if (!msg) return;
+      if (!callsign)     { alert('Enter callsign first'); return; }
+      if (!audioContext) { alert('Click "Start Audio" first'); return; }
+      msgEl.value = '';
+      const frameBytes = buildFrame(`${callsign}>${await encryptMsg(msg)}`, 'ALL');
+      const audioData  = modulate(frameBytes);
+      const buf        = audioContext.createBuffer(1, audioData.length, SAMPLE_RATE);
+      buf.getChannelData(0).set(audioData);
+      const src = audioContext.createBufferSource();
+      src.buffer = buf; src.connect(audioContext.destination); src.start();
+      addChat(`TX ${callsign}: ${msg}`, 'tx');
+    }
+
+    async function receiveMsg(raw) {
+      const sep = raw.indexOf('>');
+      addChat(`RX ${sep > 0 ? raw.slice(0, sep) : '?'}: ${
+        passphrase ? await decryptMsg(sep > 0 ? raw.slice(sep + 1) : raw)
+                   : (sep > 0 ? raw.slice(sep + 1) : raw)}`, 'rx');
+    }
+
+    function addChat(text, cls) {
+      const div = document.createElement('div');
+      div.className = cls; div.dataset.testid = `chat-entry-${cls}`;
+      div.textContent = `${new Date().toLocaleTimeString()}: ${text}`;
+      chatEl.appendChild(div); chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    // ── Audio toggle ───────────────────────────────────────────────────────────
+    async function toggleAudio() {
+      callsign   = document.getElementById('callsign').value.trim().toUpperCase();
+      passphrase = document.getElementById('passphrase').value;
+      if (!callsign) { alert('Enter callsign'); return; }
+      const statusEl = document.getElementById('status');
+
+      if (!isRunning) {
+        try {
+          audioContext   = new AudioContext({ sampleRate: SAMPLE_RATE });
+          const deviceId = document.getElementById('micSelect').value;
+          const stream   = await navigator.mediaDevices.getUserMedia({
+            audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+          });
+          micNode    = audioContext.createMediaStreamSource(stream);
+          scriptNode = audioContext.createScriptProcessor(4096, 1, 1);
+          scriptNode.onaudioprocess = e => { if (isRunning) processAudioChunk(e.inputBuffer.getChannelData(0)); };
+          micNode.connect(scriptNode);
+          const silent = audioContext.createGain(); silent.gain.value = 0;
+          scriptNode.connect(silent); silent.connect(audioContext.destination);
+          isRunning = true; statusEl.textContent = 'Running'; statusEl.style.color = 'green';
+          populateMicList();
+        } catch (e) {
+          addChat(`Audio init failed: ${e.message}`, 'err');
+          statusEl.textContent = 'Error'; statusEl.style.color = 'red'; audioContext = null;
+        }
+      } else {
+        isRunning = false; scriptNode.disconnect(); await audioContext.close();
+        audioContext = null; sampleBuffer = []; demodBits = [];
+        dpll.reset(); gpuQueue = [];
+        statusEl.textContent = 'Stopped'; statusEl.style.color = 'orange';
+      }
+    }
+  </script>
+</body>
+</html>

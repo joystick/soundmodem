@@ -1,0 +1,18 @@
+- generic [active] [ref=e1]:
+  - heading "SoundModem P2P Chat" [level=1] [ref=e2]
+  - generic [ref=e3]:
+    - text: "Callsign (required):"
+    - textbox "Callsign (required):" [ref=e4]:
+      - /placeholder: e.g. TEST01
+  - generic [ref=e5]:
+    - text: "Encryption Passphrase (optional):"
+    - textbox "Encryption Passphrase (optional):" [ref=e6]:
+      - /placeholder: shared secret
+  - generic [ref=e7]:
+    - text: "Microphone:"
+    - combobox "Microphone:" [ref=e8]:
+      - option "Default" [selected]
+  - button "Start Audio" [ref=e9]
+  - text: "Stopped Demod: GPU FM Discriminator"
+  - textbox "Type message..." [ref=e11]
+  - button "Send" [ref=e12]
