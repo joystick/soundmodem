@@ -47,7 +47,7 @@ Server: `vesta03` (SSH alias) — docroot at `/home/alexei/web/modem.kipr24.com/
 ## Testing
 
 ```bash
-npm test           # run all unit tests (54 tests, Vitest)
+npm test           # run all unit tests (67 tests, Vitest)
 npm run test:watch # watch mode
 ```
 
@@ -73,23 +73,28 @@ npm run test:watch → vitest
 
 ```
 src/
-  crc16.js        crc16(bytes) — CRC-16-CCITT
-  ax25.js         encodeCallsign, bitStuff, buildFrame(msg,dst,src), buildFrameRaw(bytes,dst,src)
-  dpll.js         DPLL class — clock recovery
-  modulate.js     modulate(frameBytes) → Float32Array; exports AFSK constants
-  goertzel.js     goertzel(samples, freq) — sliding Goertzel magnitude
-  demodulate.js   createDemodulator({onMessage, onFilePacket}) — factory, encapsulates state
-  compress.js     compress(data) / decompress(data) — DeflateRaw streams
-  crypto.js       deriveKey(passphrase) / encryptBytes(key, plain) / decryptBytes(key, cipher)
-  packet.js       encodePacket({xferId,seq,total,filename?,data}) / decodePacket(bytes)
-  gpu.js          GpuDemodulator, initWebGpu() — WebGPU compute shaders
-  audio.js        toggleAudio, sendMsg, sendFile, receiveFilePacket, playFrame
-  ui.js           addChat, populateMicList — DOM helpers
-  main.js         entry point; wires modules, manages runtime state, exposes window.* globals
+  crc16.js             crc16(bytes) — CRC-16-CCITT
+  ax25.js              encodeCallsign, bitStuff, buildFrame(msg,dst,src), buildFrameRaw(bytes,dst,src)
+  dpll.js              DPLL class — clock recovery
+  modulate.js          modulate(frameBytes) → Float32Array; exports AFSK constants
+  goertzel.js          goertzel(samples, freq) — sliding Goertzel magnitude
+  demodulate.js        createDemodulator({onMessage, onFilePacket}) — Bell 202 factory
+  compress.js          compress(data) / decompress(data) — DeflateRaw streams
+  crypto.js            deriveKey(passphrase) / encryptBytes(key, plain) / decryptBytes(key, cipher)
+  packet.js            encodePacket({xferId,seq,total,filename?,data}) / decodePacket(bytes)
+  gpu.js               GpuDemodulator, initWebGpu(), getSharedGpuDevice() — Bell 202 WebGPU shaders
+  ofdm.js              ofdmModulate(bits), ofdmDemodulateRaw(samples) — OFDM IFFT/FFT core
+  fec.js               convEncode(bits), viterbiDecode(bits), interleave/deinterleave — Rate-1/2 K=7
+  ofdm-demodulate.js   createOfdmDemodulator({onMessage, onFilePacket, onStats}) — OFDM RX pipeline
+  ofdm-gpu.js          GpuDft class, initGpuDft(device?) — WGSL 256-pt direct DFT
+  audio.js             toggleAudio, sendMsg, sendFile, receiveFilePacket, playFrame
+  ui.js                addChat, populateMicList — DOM helpers
+  main.js              entry point; wires modules, manages runtime state, exposes window.* globals
 
 test/
   crc16.test.js · ax25.test.js · dpll.test.js · modulate.test.js · goertzel (in ax25)
   demodulate.test.js · packet.test.js · compress.test.js · crypto.test.js · loopback.test.js
+  ofdm.test.js · fec.test.js · ofdm-loopback.test.js
 
 src/index.html    HTML template (<!-- BUNDLE --> placeholder)
 dist/index.html   built output — hand this to testers
@@ -106,7 +111,8 @@ Key architectural decision: `buildFrame`/`buildFrameRaw` take an explicit `src` 
 | Language | Vanilla JavaScript (ES2020 modules), no frameworks |
 | Build | Rollup 4 — IIFE bundle inlined into HTML |
 | Tests | Vitest 3 (unit) + Playwright MCP (integration) |
-| Audio I/O | Web Audio API — `AudioContext`, `MediaStreamSource`, `ScriptProcessor`, `BufferSource` |
+| Audio I/O (Bell 202) | Web Audio API — `ScriptProcessor` (deprecated but functional) |
+| Audio I/O (OFDM) | `AudioWorklet` (inlined as Blob URL) — off-main-thread processing |
 | Mic access | `navigator.mediaDevices.getUserMedia` |
 | Encryption | Web Crypto API — PBKDF2 → AES-GCM-256 |
 | Compression | `CompressionStream` / `DecompressionStream` (DeflateRaw) |
@@ -466,7 +472,10 @@ On page load `populateMicList()` does a temporary `getUserMedia` grant to read d
 | `mic-select` | Microphone device dropdown |
 | `toggle-btn` | Start / Stop Audio button |
 | `status` | Status label (Stopped / Running / Error) |
-| `demod-mode` | Active demodulator label |
+| `demod-mode` | Active demodulator label (`Bell202` / `OFDM-CPU` / `OFDM-GPU`) |
+| `ofdm-snr` | Pilot SNR badge (hidden in Bell 202 mode) |
+| `ofdm-phase-err` | Pilot phase error badge (hidden in Bell 202 mode) |
+| `modem-mode-select` | Bell202 / OFDM-HF mode selector |
 | `chat-log` | Chat message container |
 | `message-input` | Outgoing message text field |
 | `send-btn` | Send button |
@@ -487,8 +496,10 @@ On page load `populateMicList()` does a temporary `getUserMedia` grant to read d
 | `buildFrame(msg, dst, src)` | `src/ax25.js` |
 | `buildFrameRaw(bytes, dst, src)` | `src/ax25.js` |
 | `modulate(frameBytes)` | `src/modulate.js` |
-| `cpuProcessChunk(samples)` | `demodulator` instance in `main.js` |
+| `cpuProcessChunk(samples)` | Bell 202 `demodulator` instance in `main.js` |
 | `resetDemodulator()` | `demodulator.reset()` |
+| `ofdmEncodeFrame(text)` | OFDM TX — returns `Float32Array` audio samples |
+| `ofdmProcessChunk(samples)` | OFDM RX — feeds samples into the active OFDM demodulator |
 | `compress(data)` / `decompress(data)` | `src/compress.js` |
 | `createDemodulator({onMessage, onFilePacket})` | `src/demodulate.js` |
 | `DPLL` | `src/dpll.js` |
@@ -499,7 +510,7 @@ On page load `populateMicList()` does a temporary `getUserMedia` grant to read d
 
 ## Known limitations / future work
 
-- `ScriptProcessor` is deprecated — migrate to `AudioWorklet` for production use
+- `ScriptProcessor` still used for Bell 202 mode — migrate to `AudioWorklet` for production use (OFDM already uses AudioWorklet)
 - Zero-salt PBKDF2 is weak against offline dictionary attacks
 - No carrier detect — demodulator starts immediately on any audio; add squelch for VHF use
 - Broadcast only (destination hardcoded to `ALL`)
