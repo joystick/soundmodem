@@ -302,6 +302,7 @@ async function toggleAudio() {
   callsign   = document.getElementById('callsign').value.trim().toUpperCase();
   passphrase = document.getElementById('passphrase').value;
   if (!callsign) { alert('Enter callsign'); return; }
+  localStorage.setItem('callsign', callsign);
 
   if (!isRunning) {
     try {
@@ -386,6 +387,10 @@ function getGpuDft() {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 populateMicList();
+
+// Restore callsign from last session
+const _savedCallsign = localStorage.getItem('callsign');
+if (_savedCallsign) document.getElementById('callsign').value = _savedCallsign;
 
 // ── Expose globals for Playwright tests ───────────────────────────────────
 window.buildFrame      = (msg, dst, src) => buildFrame(msg, dst, src || 'TEST01');
