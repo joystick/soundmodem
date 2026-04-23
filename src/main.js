@@ -330,34 +330,51 @@ registerProcessor('ofdm-processor', OfdmProcessor);`;
         const workletUrl = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
         await audioContext.audioWorklet.addModule(workletUrl);
         URL.revokeObjectURL(workletUrl);
-        // EMA state for smoothing per-symbol stats before display (α=0.15 ≈ 6-sample TC)
-        const STATS_ALPHA = 0.15;
+        // Sparkline helper — draws a scrolling line graph on a canvas element.
+        // history: number[], min/max: display range, color: CSS color string, label: text overlay
+        function drawSparkline(canvas, history, { min, max, color, label }) {
+          const ctx = canvas.getContext('2d');
+          const w = canvas.width, h = canvas.height;
+          ctx.clearRect(0, 0, w, h);
+          ctx.fillStyle = 'rgba(0,0,0,0.45)';
+          ctx.beginPath(); ctx.roundRect(0, 0, w, h, 4); ctx.fill();
+          if (history.length >= 2) {
+            ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
+            ctx.beginPath();
+            history.forEach((v, i) => {
+              const x = (i / (history.length - 1)) * w;
+              const y = h - ((Math.min(Math.max(v, min), max) - min) / (max - min)) * (h - 4) - 2;
+              i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+          }
+          ctx.fillStyle = color; ctx.font = 'bold 9px monospace';
+          ctx.fillText(label, 3, h - 3);
+        }
+
+        // EMA state + history buffers for sparklines (60 pts ≈ ~10 s at typical frame rate)
+        const STATS_ALPHA = 0.15, HISTORY_LEN = 60;
         let smoothSnr = null, smoothPhase = null;
+        const snrHistory = [], phaseHistory = [];
         ofdmDemodInstance = createOfdmDemodulator({
           onMessage: receiveMsg,
           onFilePacket: receiveFilePacket,
           gpuDft: gpuDftInst,
           onStats: ({ snrDb, phaseErrRad }) => {
             if (!isRunning) return; // discard late GPU callbacks after stop
-            // Seed on first sample; apply EMA thereafter
             smoothSnr   = smoothSnr   === null ? snrDb       : smoothSnr   + STATS_ALPHA * (snrDb       - smoothSnr);
             smoothPhase = smoothPhase === null ? phaseErrRad : smoothPhase + STATS_ALPHA * (phaseErrRad - smoothPhase);
-            const snrEl   = document.getElementById('ofdm-snr');
-            const phaseEl = document.getElementById('ofdm-phase-err');
-            // Only show stats when SNR is high enough to indicate real signal (>3 dB).
-            // Below that, noise dominates and the values are meaningless.
-            if (smoothSnr < 3) {
-              snrEl.classList.add('d-none');
-              phaseEl.classList.add('d-none');
-              return;
-            }
-            const snrClamped = Math.min(Math.max(smoothSnr, -9.9), 99.9);
-            snrEl.textContent   = `Eb/N₀ ${snrClamped.toFixed(1)} dB`;
-            phaseEl.textContent = `φ ${(smoothPhase * 180 / Math.PI).toFixed(1)}°`;
-            snrEl.classList.remove('d-none');
-            phaseEl.classList.remove('d-none');
+            snrHistory.push(smoothSnr);     if (snrHistory.length   > HISTORY_LEN) snrHistory.shift();
+            phaseHistory.push(smoothPhase); if (phaseHistory.length > HISTORY_LEN) phaseHistory.shift();
+            const snrLabel   = `SNR ${Math.min(Math.max(smoothSnr, -9.9), 99.9).toFixed(1)} dB`;
+            const phaseLabel = `φ ${(smoothPhase * 180 / Math.PI).toFixed(1)}°`;
+            drawSparkline(document.getElementById('ofdm-snr-graph'),   snrHistory,   { min: -10, max: 30,  color: '#0dcaf0', label: snrLabel });
+            drawSparkline(document.getElementById('ofdm-phase-graph'), phaseHistory, { min: -Math.PI, max: Math.PI, color: '#adb5bd', label: phaseLabel });
           },
         });
+        // Show graphs immediately when OFDM starts (they draw as data arrives)
+        document.getElementById('ofdm-snr').classList.remove('d-none');
+        document.getElementById('ofdm-phase-err').classList.remove('d-none');
         ofdmWorkletNode = new AudioWorkletNode(audioContext, 'ofdm-processor');
         ofdmWorkletNode.port.onmessage = e => {
           if (isRunning) ofdmDemodInstance.processChunk(e.data);

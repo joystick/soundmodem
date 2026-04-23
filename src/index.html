@@ -81,9 +81,15 @@
         <span id="demod-mode" data-testid="demod-mode"
           class="badge rounded-pill bg-secondary text-light" style="font-size:0.7rem;"></span>
         <span id="ofdm-snr" data-testid="ofdm-snr"
-          class="d-none badge rounded-pill bg-info text-dark" style="font-size:0.7rem;"></span>
+          class="d-none" style="vertical-align:middle;">
+          <canvas id="ofdm-snr-graph" width="88" height="28"
+            style="border-radius:4px;display:block;"></canvas>
+        </span>
         <span id="ofdm-phase-err" data-testid="ofdm-phase-err"
-          class="d-none badge rounded-pill bg-secondary text-light" style="font-size:0.7rem;"></span>
+          class="d-none" style="vertical-align:middle;">
+          <canvas id="ofdm-phase-graph" width="88" height="28"
+            style="border-radius:4px;display:block;"></canvas>
+        </span>
       </span>
     </div>
 
