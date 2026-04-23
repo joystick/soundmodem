@@ -289,6 +289,7 @@ async function sendFile() {
                       xferId[1].toString(16).padStart(2, '0');
     const total     = Math.max(1, Math.ceil(compressed.length / CHUNK_SIZE));
     let totalRetransmits = 0;
+    const rttSamples = [];
     updateXferProgress(file.name, 0, total);
 
     for (let seq = 0; seq < total; seq++) {
@@ -304,10 +305,13 @@ async function sendFile() {
 
         if (attempt > 0) {
           totalRetransmits++;
-          addChat(`TX FILE ${file.name} — retransmit fragment ${seq + 1}/${total} (attempt ${attempt + 1}/${N2_MAX + 1})`, 'file');
+          updateXferStatus(`Fragment ${seq + 1}/${total}: retransmitting (attempt ${attempt + 1}/${N2_MAX + 1})`);
+        } else {
+          updateXferStatus(`Fragment ${seq + 1}/${total}: sending…`);
         }
 
         // Transmit fragment
+        const txStart = performance.now();
         if (fsmContext.mode === 'ofdm') {
           await playOfdmFrame(encrypted);
         } else {
@@ -315,12 +319,19 @@ async function sendFile() {
         }
 
         // Wait for ACK
+        updateXferStatus(`Fragment ${seq + 1}/${total}: waiting for ACK…`);
         acked = await waitForAck(xferIdHex, seq);
-        if (acked) break;
+        if (acked) {
+          rttSamples.push(performance.now() - txStart);
+          updateXferStatus(`Fragment ${seq + 1}/${total}: ACK received`);
+          break;
+        }
+        updateXferStatus(`Fragment ${seq + 1}/${total}: timeout`);
       }
 
       if (_cancelXfer) break;
       if (!acked) {
+        updateXferStatus(`Fragment ${seq + 1}/${total}: failed`);
         addChat(`TX FILE ${file.name} — fragment ${seq + 1}/${total} failed after ${N2_MAX + 1} attempts, aborting`, 'err');
         break;
       }
@@ -328,10 +339,14 @@ async function sendFile() {
       updateXferProgress(file.name, seq + 1, total);
     }
 
+    const avgRtt = rttSamples.length
+      ? (rttSamples.reduce((a, b) => a + b, 0) / rttSamples.length / 1000).toFixed(1)
+      : '?';
+
     if (_cancelXfer) {
       addChat(`TX FILE ${file.name} — cancelled`, 'file');
     } else {
-      addChat(`TX FILE ${file.name} — all ${total} fragment(s) delivered (${totalRetransmits} retransmit${totalRetransmits !== 1 ? 's' : ''})`, 'file');
+      addChat(`TX FILE ${file.name} — ${total}/${total} fragments, ${totalRetransmits} retransmit${totalRetransmits !== 1 ? 's' : ''}, avg RTT ${avgRtt}s`, 'file');
     }
   } catch (err) {
     addChat(`TX FILE ${file.name} — error: ${err.message}`, 'err');
@@ -351,6 +366,10 @@ function updateXferProgress(filename, sent, total) {
   document.getElementById('xfer-filename').textContent  = filename;
   document.getElementById('xfer-frag-count').textContent = `${sent} / ${total}`;
   document.getElementById('xfer-bar').style.width = `${total ? (sent / total) * 100 : 0}%`;
+}
+
+function updateXferStatus(text) {
+  document.getElementById('xfer-status').textContent = text;
 }
 
 function togglePauseTx() {
