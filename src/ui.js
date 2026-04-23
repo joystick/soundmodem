@@ -13,15 +13,18 @@ export async function populateMicList(selEl) {
   try {
     const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
     tmp.getTracks().forEach(t => t.stop());
-    (await navigator.mediaDevices.enumerateDevices())
-      .filter(d => d.kind === 'audioinput')
-      .forEach(d => {
-        const opt = document.createElement('option');
-        opt.value = d.deviceId; opt.textContent = d.label || d.deviceId;
-        if (d.label.toLowerCase().includes('webcam') || d.label.toLowerCase().includes('general'))
-          opt.selected = true;
-        selEl.appendChild(opt);
-      });
+    const devices = (await navigator.mediaDevices.enumerateDevices())
+      .filter(d => d.kind === 'audioinput');
+    // Clear existing options (except the static "Default") before repopulating
+    // so a second call after audio permission is granted doesn't duplicate entries.
+    selEl.innerHTML = '<option value="">Default</option>';
+    devices.forEach(d => {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId; opt.textContent = d.label || d.deviceId;
+      if (d.label.toLowerCase().includes('webcam') || d.label.toLowerCase().includes('general'))
+        opt.selected = true;
+      selEl.appendChild(opt);
+    });
   } catch { /* no permission yet */ }
 }
 
