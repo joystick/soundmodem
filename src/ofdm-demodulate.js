@@ -138,7 +138,7 @@ function decodeFrame(rawBits) {
     bytes[b] = byte;
   }
 
-  return new TextDecoder().decode(bytes);
+  return bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +196,17 @@ export function createOfdmDemodulator({ onMessage, onFilePacket, onStats = null,
     gpuReady = true;
   }
 
+  // Route a decoded frame to the appropriate callback.
+  // FILE_MAGIC = [0xFE, 0xFF] → onFilePacket; otherwise decode as UTF-8 → onMessage.
+  function dispatchFrame(bytes) {
+    if (bytes === null) return;
+    if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) {
+      if (onFilePacket) onFilePacket(bytes);
+    } else {
+      onMessage(new TextDecoder().decode(bytes));
+    }
+  }
+
   function _enqueue(samples) {
     const merged = new Float32Array(sampleBuffer.length + samples.length);
     merged.set(sampleBuffer);
@@ -210,15 +221,10 @@ export function createOfdmDemodulator({ onMessage, onFilePacket, onStats = null,
 
       if (resolvedGpu) {
         ofdmDemodulateWithGpu(frame, s => resolvedGpu.dft(s), onStats)
-          .then(rawBits => {
-            const text = decodeFrame(rawBits);
-            if (text !== null) onMessage(text);
-          })
+          .then(rawBits => { dispatchFrame(decodeFrame(rawBits)); })
           .catch(() => {});
       } else {
-        const rawBits = ofdmDemodulateWithAfc(frame, onStats);
-        const text    = decodeFrame(rawBits);
-        if (text !== null) onMessage(text);
+        dispatchFrame(decodeFrame(ofdmDemodulateWithAfc(frame, onStats)));
       }
     }
   }
