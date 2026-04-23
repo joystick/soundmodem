@@ -90,8 +90,8 @@ test.describe('Phase 4 — OFDM AudioWorklet integration', () => {
     // Wait for status to leave Stopped
     await expect(page.locator('[data-testid="status"]')).not.toHaveText('Stopped', { timeout: 5000 });
 
-    // demod-mode label should say OFDM-CPU
-    await expect(page.locator('[data-testid="demod-mode"]')).toHaveText('OFDM-CPU');
+    // demod-mode label should say OFDM-CPU or OFDM-GPU depending on WebGPU availability
+    await expect(page.locator('[data-testid="demod-mode"]')).toHaveText(/^OFDM-(CPU|GPU)$/);
 
     // No JS errors
     expect(page._collectedErrors).toHaveLength(0);

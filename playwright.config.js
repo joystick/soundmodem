@@ -7,7 +7,13 @@ export default defineConfig({
     browserName: 'chromium',
     // Required for getUserMedia and AudioWorklet
     launchOptions: {
-      args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'],
+      args: [
+        '--use-fake-ui-for-media-stream',
+        '--use-fake-device-for-media-stream',
+        // Enable WebGPU adapter in Chromium test environment
+        '--enable-unsafe-webgpu',
+        '--ignore-gpu-blocklist',
+      ],
     },
     permissions: ['microphone'],
   },

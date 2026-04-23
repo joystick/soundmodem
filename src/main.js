@@ -6,10 +6,11 @@ import { goertzel } from './goertzel.js';
 import { createDemodulator } from './demodulate.js';
 import { compress, decompress } from './compress.js';
 import { deriveKey, encryptBytes as cryptoEncryptBytes, decryptBytes as cryptoDecryptBytes } from './crypto.js';
-import { GpuDemodulator, initWebGpu } from './gpu.js';
+import { GpuDemodulator, initWebGpu, getSharedGpuDevice } from './gpu.js';
 import { addChat as addChatFn, populateMicList as populateMicListFn, setAudioState } from './ui.js';
 import { ofdmEncodeFrame, OFDM_INTERLEAVE_DEPTH } from './ofdm.js';
 import { createOfdmDemodulator } from './ofdm-demodulate.js';
+import { initGpuDft } from './ofdm-gpu.js';
 
 // ── Runtime state ─────────────────────────────────────────────────────────
 let audioContext, micNode, scriptNode, isRunning = false;
@@ -313,10 +314,12 @@ async function toggleAudio() {
 
       if (modemMode === 'ofdm') {
         // OFDM-HF path: AudioWorklet relays samples → main thread OFDM demodulator
+        const gpuDftInst = await getGpuDft(); // null if WebGPU unavailable
         await audioContext.audioWorklet.addModule('/src/ofdm-worklet.js');
         ofdmDemodInstance = createOfdmDemodulator({
           onMessage: receiveMsg,
           onFilePacket: receiveFilePacket,
+          gpuDft: gpuDftInst,
         });
         ofdmWorkletNode = new AudioWorkletNode(audioContext, 'ofdm-processor');
         ofdmWorkletNode.port.onmessage = e => {
@@ -325,7 +328,7 @@ async function toggleAudio() {
         micNode.connect(ofdmWorkletNode);
         const silent = audioContext.createGain(); silent.gain.value = 0;
         ofdmWorkletNode.connect(silent); silent.connect(audioContext.destination);
-        document.getElementById('demod-mode').textContent = 'OFDM-CPU';
+        document.getElementById('demod-mode').textContent = gpuDftInst ? 'OFDM-GPU' : 'OFDM-CPU';
       } else {
         // Bell 202 path: legacy ScriptProcessor → GPU or CPU Goertzel
         scriptNode = audioContext.createScriptProcessor(4096, 1, 1);
@@ -356,7 +359,18 @@ async function toggleAudio() {
 }
 
 // ── WebGPU init ────────────────────────────────────────────────────────────
-initWebGpu(addChat).then(dem => { gpuDemodulator = dem; });
+// Both initWebGpu and initGpuDft call requestAdapter. Running them concurrently
+// can cause the second requestAdapter to return null. Chain the OFDM DFT init
+// so it only starts after the Bell-202 GPU init has fully settled.
+const _webGpuSettled = initWebGpu(addChat).then(dem => { gpuDemodulator = dem; });
+let _gpuDftPromise = null;
+function getGpuDft() {
+  if (!_gpuDftPromise) {
+    // Chain after Bell-202 GPU init so the shared device is ready; reuse it.
+    _gpuDftPromise = _webGpuSettled.then(() => initGpuDft(getSharedGpuDevice()));
+  }
+  return _gpuDftPromise;
+}
 
 // ── Init ───────────────────────────────────────────────────────────────────
 populateMicList();
@@ -380,6 +394,11 @@ window.sendMsg           = sendMsg;
 window.setModemMode      = setModemMode;
 window.ofdmEncodeFrame   = ofdmEncodeFrame;
 window.createOfdmDemodulator = createOfdmDemodulator;
+window.gpuDft            = async (samples) => {
+  const inst = await getGpuDft();
+  if (!inst) throw new Error('WebGPU not available');
+  return inst.dft(samples instanceof Float32Array ? samples : new Float32Array(samples));
+};
 window.sendFile        = sendFile;
 window.MARK_FREQ       = MARK_FREQ;
 window.SPACE_FREQ      = SPACE_FREQ;

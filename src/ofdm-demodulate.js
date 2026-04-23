@@ -1,8 +1,10 @@
 // OFDM demodulator — Phase 3: CPU path with pilot-phase AFC
-// Pipeline: ofdmDemodulateRaw → deinterleave → viterbiDecode → frame parse → callbacks
+// Phase 5: optional GPU DFT path via gpuDft option or preferGpu flag.
+// Pipeline: DFT (CPU or GPU) → pilot AFC → Viterbi FEC → frame parse → callbacks
 
 import { ofdmDemodulateRaw, OFDM_N, OFDM_CP, OFDM_DATA_CARRIERS, OFDM_PILOT_BINS } from './ofdm.js';
 import { viterbiDecode, deinterleave } from './fec.js';
+import { initGpuDft } from './ofdm-gpu.js';
 
 export const INTERLEAVE_DEPTH = OFDM_DATA_CARRIERS.length; // 52 — one symbol per row
 
@@ -123,37 +125,98 @@ function decodeFrame(rawBits) {
 }
 
 // ---------------------------------------------------------------------------
-// createOfdmDemodulator({ onMessage, onFilePacket }) → { processChunk, reset }
-// Mirrors the createDemodulator interface from demodulate.js.
+// GPU DFT demodulation path
+// Uses the GPU for the per-symbol DFT; pilot AFC and Viterbi run on CPU.
+// ---------------------------------------------------------------------------
+async function ofdmDemodulateWithGpu(samples, gpuDftFn) {
+  const dataCarriers = OFDM_DATA_CARRIERS;
+  const numSymbols = Math.floor(samples.length / SYM_LEN);
+  const bits = [];
+
+  for (let s = 0; s < numSymbols; s++) {
+    const base = s * SYM_LEN + OFDM_CP;
+    const window = samples.slice(base, base + OFDM_N);
+    // GPU DFT returns Float32Arrays; convert to Float64-compatible objects for AFC
+    const { re: reF32, im: imF32 } = await gpuDftFn(new Float32Array(window));
+    // Copy to mutable arrays for pilot AFC rotation
+    const re = new Float64Array(reF32);
+    const im = new Float64Array(imF32);
+    applyPilotAfc(re, im);
+    for (const bin of dataCarriers) {
+      bits.push(re[bin] >= 0);
+    }
+  }
+
+  return bits;
+}
+
+// ---------------------------------------------------------------------------
+// createOfdmDemodulator({ onMessage, onFilePacket, gpuDft?, preferGpu? })
+//   → { processChunk, reset }
+//
+// gpuDft    — a pre-initialized GpuDft instance (or null for CPU fallback)
+// preferGpu — if true and gpuDft not supplied, initialise GPU internally
+//
 // processChunk accepts a Float32Array of audio samples (any length).
 // A frame is decoded when a complete set of symbols has been received.
 // ---------------------------------------------------------------------------
-export function createOfdmDemodulator({ onMessage, onFilePacket }) {
+export function createOfdmDemodulator({ onMessage, onFilePacket, gpuDft = null, preferGpu = false }) {
   let sampleBuffer = new Float32Array(0);
+  let resolvedGpu = gpuDft;       // GpuDft instance or null
+  let gpuReady    = !!gpuDft;     // true once we know GPU state
+  let pendingChunks = [];         // queued while GPU init is in-flight
 
-  function processChunk(samples) {
-    // Append to buffer
+  // Start GPU init if requested and not already supplied
+  if (!gpuDft && preferGpu) {
+    initGpuDft().then(inst => {
+      resolvedGpu = inst;
+      gpuReady    = true;
+      // Drain any samples that arrived during init
+      const queued = pendingChunks.splice(0);
+      for (const chunk of queued) _enqueue(chunk);
+    });
+  } else {
+    gpuReady = true;
+  }
+
+  function _enqueue(samples) {
     const merged = new Float32Array(sampleBuffer.length + samples.length);
     merged.set(sampleBuffer);
     merged.set(samples, sampleBuffer.length);
     sampleBuffer = merged;
 
-    // Process complete sets of symbols
     while (sampleBuffer.length >= SYM_LEN) {
-      // Take the largest complete symbol-aligned block
       const numSymbols = Math.floor(sampleBuffer.length / SYM_LEN);
-      const frameLen = numSymbols * SYM_LEN;
-      const frame = sampleBuffer.slice(0, frameLen);
-      sampleBuffer = sampleBuffer.slice(frameLen);
+      const frameLen   = numSymbols * SYM_LEN;
+      const frame      = sampleBuffer.slice(0, frameLen);
+      sampleBuffer     = sampleBuffer.slice(frameLen);
 
-      const rawBits = ofdmDemodulateWithAfc(frame);
-      const text = decodeFrame(rawBits);
-      if (text !== null) onMessage(text);
+      if (resolvedGpu) {
+        ofdmDemodulateWithGpu(frame, s => resolvedGpu.dft(s))
+          .then(rawBits => {
+            const text = decodeFrame(rawBits);
+            if (text !== null) onMessage(text);
+          })
+          .catch(() => {});
+      } else {
+        const rawBits = ofdmDemodulateWithAfc(frame);
+        const text    = decodeFrame(rawBits);
+        if (text !== null) onMessage(text);
+      }
     }
   }
 
+  function processChunk(samples) {
+    if (!gpuReady) {
+      pendingChunks.push(new Float32Array(samples)); // copy — caller buffer may be reused
+      return;
+    }
+    _enqueue(samples);
+  }
+
   function reset() {
-    sampleBuffer = new Float32Array(0);
+    sampleBuffer  = new Float32Array(0);
+    pendingChunks = [];
   }
 
   return { processChunk, reset };
