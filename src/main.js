@@ -8,10 +8,15 @@ import { compress, decompress } from './compress.js';
 import { deriveKey, encryptBytes as cryptoEncryptBytes, decryptBytes as cryptoDecryptBytes } from './crypto.js';
 import { GpuDemodulator, initWebGpu } from './gpu.js';
 import { addChat as addChatFn, populateMicList as populateMicListFn, setAudioState } from './ui.js';
+import { ofdmEncodeFrame, OFDM_INTERLEAVE_DEPTH } from './ofdm.js';
+import { createOfdmDemodulator } from './ofdm-demodulate.js';
 
 // ── Runtime state ─────────────────────────────────────────────────────────
 let audioContext, micNode, scriptNode, isRunning = false;
 let callsign = '', passphrase = '', cryptoKey = null;
+let modemMode = 'bell202'; // 'bell202' | 'ofdm'
+let ofdmWorkletNode = null;
+let ofdmDemodInstance = null;
 const incomingTransfers = new Map();
 
 const chatEl   = document.getElementById('chat');
@@ -23,6 +28,11 @@ let gpuBusy        = false;
 // ── Helpers ───────────────────────────────────────────────────────────────
 function addChat(text, cls) {
   addChatFn(chatEl, text, cls);
+}
+
+function setModemMode(mode) {
+  modemMode = mode;
+  document.getElementById('modemMode').value = mode;
 }
 
 async function ensureCryptoKey() {
@@ -158,9 +168,14 @@ async function sendMsg() {
   if (!callsign)     { alert('Enter callsign first'); return; }
   if (!audioContext) { alert('Click "Start Audio" first'); return; }
   msgEl.value = '';
-  const frameBytes = buildFrame(`${callsign}>${await encryptMsg(msg)}`, 'ALL', callsign);
-  const audioData  = modulate(frameBytes);
-  const buf        = audioContext.createBuffer(1, audioData.length, SAMPLE_RATE);
+  let audioData;
+  if (modemMode === 'ofdm') {
+    audioData = ofdmEncodeFrame(`${callsign}>${await encryptMsg(msg)}`);
+  } else {
+    const frameBytes = buildFrame(`${callsign}>${await encryptMsg(msg)}`, 'ALL', callsign);
+    audioData = modulate(frameBytes);
+  }
+  const buf = audioContext.createBuffer(1, audioData.length, SAMPLE_RATE);
   buf.getChannelData(0).set(audioData);
   const src = audioContext.createBufferSource();
   src.buffer = buf; src.connect(audioContext.destination); src.start();
@@ -294,12 +309,32 @@ async function toggleAudio() {
       const stream   = await navigator.mediaDevices.getUserMedia({
         audio: deviceId ? { deviceId: { exact: deviceId } } : true,
       });
-      micNode    = audioContext.createMediaStreamSource(stream);
-      scriptNode = audioContext.createScriptProcessor(4096, 1, 1);
-      scriptNode.onaudioprocess = e => { if (isRunning) processAudioChunk(e.inputBuffer.getChannelData(0)); };
-      micNode.connect(scriptNode);
-      const silent = audioContext.createGain(); silent.gain.value = 0;
-      scriptNode.connect(silent); silent.connect(audioContext.destination);
+      micNode = audioContext.createMediaStreamSource(stream);
+
+      if (modemMode === 'ofdm') {
+        // OFDM-HF path: AudioWorklet relays samples → main thread OFDM demodulator
+        await audioContext.audioWorklet.addModule('/src/ofdm-worklet.js');
+        ofdmDemodInstance = createOfdmDemodulator({
+          onMessage: receiveMsg,
+          onFilePacket: receiveFilePacket,
+        });
+        ofdmWorkletNode = new AudioWorkletNode(audioContext, 'ofdm-processor');
+        ofdmWorkletNode.port.onmessage = e => {
+          if (isRunning) ofdmDemodInstance.processChunk(e.data);
+        };
+        micNode.connect(ofdmWorkletNode);
+        const silent = audioContext.createGain(); silent.gain.value = 0;
+        ofdmWorkletNode.connect(silent); silent.connect(audioContext.destination);
+        document.getElementById('demod-mode').textContent = 'OFDM-CPU';
+      } else {
+        // Bell 202 path: legacy ScriptProcessor → GPU or CPU Goertzel
+        scriptNode = audioContext.createScriptProcessor(4096, 1, 1);
+        scriptNode.onaudioprocess = e => { if (isRunning) processAudioChunk(e.inputBuffer.getChannelData(0)); };
+        micNode.connect(scriptNode);
+        const silent = audioContext.createGain(); silent.gain.value = 0;
+        scriptNode.connect(silent); silent.connect(audioContext.destination);
+      }
+
       isRunning = true; setAudioState('running');
       populateMicList();
     } catch (e) {
@@ -307,10 +342,15 @@ async function toggleAudio() {
       setAudioState('error'); audioContext = null;
     }
   } else {
-    isRunning = false; scriptNode.disconnect(); await audioContext.close();
+    isRunning = false;
+    if (scriptNode) scriptNode.disconnect();
+    if (ofdmWorkletNode) { ofdmWorkletNode.disconnect(); ofdmWorkletNode = null; }
+    if (ofdmDemodInstance) { ofdmDemodInstance.reset(); ofdmDemodInstance = null; }
+    await audioContext.close();
     audioContext = null; demodulator.reset();
     gpuDpll.reset(); gpuDemodBits = []; gpuScanPos = 0;
     gpuQueue = []; cryptoKey = null;
+    document.getElementById('demod-mode').textContent = '';
     setAudioState('stopped');
   }
 }
@@ -335,8 +375,11 @@ window.cpuProcessChunk   = (samples) => demodulator.cpuProcessChunk(samples);
 window.resetDemodulator  = () => demodulator.reset();
 window.compress          = compress;
 window.decompress        = decompress;
-window.toggleAudio     = toggleAudio;
-window.sendMsg         = sendMsg;
+window.toggleAudio       = toggleAudio;
+window.sendMsg           = sendMsg;
+window.setModemMode      = setModemMode;
+window.ofdmEncodeFrame   = ofdmEncodeFrame;
+window.createOfdmDemodulator = createOfdmDemodulator;
 window.sendFile        = sendFile;
 window.MARK_FREQ       = MARK_FREQ;
 window.SPACE_FREQ      = SPACE_FREQ;
