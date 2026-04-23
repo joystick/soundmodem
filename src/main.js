@@ -389,6 +389,8 @@ function cancelTx() {
   _cancelXfer = true;
   if (_pauseResolve) { _pauseResolve(); _pauseResolve = null; }
   _pauseGate = Promise.resolve();
+  // Unblock any pending waitForAck so cancel is immediate
+  if (_ackResolve) { _ackResolve(false); _ackResolve = null; }
   if (fsmState === S.TX_PAUSED) dispatch({ type: E.CANCEL_TX });
   // If currently TX (playing a fragment), let TX_DONE fire normally;
   // _cancelXfer will break the loop before the next fragment starts.
