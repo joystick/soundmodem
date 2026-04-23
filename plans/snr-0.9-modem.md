@@ -5,7 +5,7 @@
 ## Architectural decisions
 
 - **Modem modes**: OFDM-HF lives alongside Bell 202 — not a replacement. UI toggle switches active mode.
-- **OFDM parameters**: N=256 IFFT/FFT, CP=64 samples, 52 data subcarriers (bins 6–31 + 33–58), 4 pilot bins (bins 5, 32, 59, 10). Symbol period = 320 samples @ 44100 Hz ≈ 7.26 ms.
+- **OFDM parameters**: N=256 IFFT/FFT, CP=64 samples, 52 data subcarriers (bins 6–31 + 33–58), 4 pilot bins (bins 8, 22, 36, 50). Symbol period = 320 samples @ 44100 Hz ≈ 7.26 ms.
 - **FEC**: Rate 1/2, K=7 convolutional code (polynomials 171₈/133₈) + block interleaver. Viterbi decode. Hard-decision.
 - **Framing**: AX.25 UI frames + CRC-16 retained as outer integrity layer.
 - **Audio I/O**: AudioWorklet replaces ScriptProcessor for OFDM mode. Worklet inlined as Blob URL for single-file deployment (no separate module URL needed).
@@ -134,3 +134,59 @@ On page load, read `localStorage` and pre-populate callsign, passphrase, and mod
 - [x] Modem mode selector is restored from `localStorage` on page load
 - [x] Changing the modem mode selector saves the new value to `localStorage`
 - [x] Works in both dev (`src/index.html`) and production (`dist/index.html`) builds
+
+---
+
+## Phase 8: FSM Audio Lifecycle Refactor
+
+**User stories**: Deterministic UI state — no ambiguous `isRunning` flag, no impossible states (e.g. sending while stopping).
+
+### What to build
+
+Replace `isRunning` + `modemMode` boolean flags with a hand-rolled FSM in `src/fsm.js`. Pure `transition(state, event, context)` function. States: `idle`, `requesting-mic`, `mic-denied`, `initializing`, `running`, `tx`, `stopping`, `error`. All side effects gated on FSM state in `renderState` and `handleStateEntry`. Mode selector disabled while audio is active.
+
+### Acceptance criteria
+
+- [x] `src/fsm.js` exports `S`, `E`, `transition`, `isAudioActive`
+- [x] `test/fsm.test.js` covers all transitions and the full happy path
+- [x] Mode selector disabled while `isAudioActive(state)` is true
+- [x] `S.TX` state prevents concurrent chat + file TX (`sendMsg` and `sendFile` dispatch `START_TX` / `TX_DONE`)
+- [x] Stop Audio works as emergency stop from any active state
+
+---
+
+## Phase 9: File Transfer End-to-End Fix
+
+**User stories**: Actually send and receive files over Bell 202 and OFDM audio without coding bugs.
+
+### What to build
+
+Fix three bugs blocking file transfer: missing `CHUNK_SIZE` import, OFDM `decodeFrame` returning a string instead of `Uint8Array`, and `playFrame` used for OFDM TX. Add `ofdmEncodeFrameRaw(bytes)` to `ofdm.js`. Add `dispatchFrame()` to `ofdm-demodulate.js` for FILE_MAGIC routing. Add `playOfdmFrame()` to `main.js`. Prove it works with `test/file-transfer.test.js` end-to-end loopback tests.
+
+### Acceptance criteria
+
+- [x] Bell 202 single-fragment file round-trips end-to-end in a Vitest loopback
+- [x] Bell 202 multi-fragment: each fragment decoded independently (fresh demodulator per fragment)
+- [x] OFDM single-packet file round-trips end-to-end
+- [x] `compress → encodePacket → decodePacket → decompress` cycle reconstructs original bytes
+- [x] All 7 file-transfer tests pass under `npm test`
+
+---
+
+## Phase 10: File Transfer Progress Bar + Pause/Resume
+
+**User stories**: See transfer progress; pause to send a message mid-transfer; resume or cancel.
+
+### What to build
+
+Add `S.TX_PAUSED` FSM state. A Bootstrap progress bar panel (hidden by default) appears above the message input during TX. Between fragments, `sendFile` awaits a pause gate `Promise`; clicking Pause replaces the gate with a pending `Promise` and transitions to `S.TX_PAUSED`, re-enabling chat controls. Clicking Resume resolves the gate and transitions back to `S.TX`. Cancel sets a flag, resolves the gate, and transitions to `S.RUNNING`.
+
+### Acceptance criteria
+
+- [x] `S.TX_PAUSED` state in FSM with `PAUSE_TX`, `RESUME_TX`, `CANCEL_TX` events
+- [x] Progress panel shows filename + "sent / total" fragment count + animated Bootstrap bar
+- [x] Pause stops after current fragment; bar freezes, button changes to "▶ Resume"
+- [x] Message input + Send re-enabled while paused; Send File remains disabled
+- [x] Resume unblocks the loop; bar animates again
+- [x] Cancel exits the loop cleanly after current fragment, logs "cancelled"
+- [x] Stop Audio (emergency) works from both `tx` and `tx-paused` states

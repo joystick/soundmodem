@@ -47,7 +47,7 @@ Server: `vesta03` (SSH alias) — docroot at `/home/alexei/web/modem.kipr24.com/
 ## Testing
 
 ```bash
-npm test           # run all unit tests (67 tests, Vitest)
+npm test           # run all unit tests (105 tests, Vitest)
 npm run test:watch # watch mode
 ```
 
@@ -82,25 +82,29 @@ src/
   compress.js          compress(data) / decompress(data) — DeflateRaw streams
   crypto.js            deriveKey(passphrase) / encryptBytes(key, plain) / decryptBytes(key, cipher)
   packet.js            encodePacket({xferId,seq,total,filename?,data}) / decodePacket(bytes)
+  fsm.js               S, E, transition(state,event,ctx), isAudioActive(state) — audio lifecycle FSM
   gpu.js               GpuDemodulator, initWebGpu(), getSharedGpuDevice() — Bell 202 WebGPU shaders
-  ofdm.js              ofdmModulate(bits), ofdmDemodulateRaw(samples) — OFDM IFFT/FFT core
+  ofdm.js              ofdmModulate(bits), ofdmDemodulateRaw(samples), ofdmEncodeFrameRaw(bytes) — OFDM core
   fec.js               convEncode(bits), viterbiDecode(bits), interleave/deinterleave — Rate-1/2 K=7
   ofdm-demodulate.js   createOfdmDemodulator({onMessage, onFilePacket, onStats}) — OFDM RX pipeline
   ofdm-gpu.js          GpuDft class, initGpuDft(device?) — WGSL 256-pt direct DFT
-  audio.js             toggleAudio, sendMsg, sendFile, receiveFilePacket, playFrame
   ui.js                addChat, populateMicList — DOM helpers
-  main.js              entry point; wires modules, manages runtime state, exposes window.* globals
+  main.js              entry point; wires modules, manages FSM state, exposes window.* globals
 
 test/
   crc16.test.js · ax25.test.js · dpll.test.js · modulate.test.js · goertzel (in ax25)
   demodulate.test.js · packet.test.js · compress.test.js · crypto.test.js · loopback.test.js
-  ofdm.test.js · fec.test.js · ofdm-loopback.test.js
+  ofdm.test.js · fec.test.js · ofdm-loopback.test.js · fsm.test.js · file-transfer.test.js
 
 src/index.html    HTML template (<!-- BUNDLE --> placeholder)
 dist/index.html   built output — hand this to testers
 ```
 
-Key architectural decision: `buildFrame`/`buildFrameRaw` take an explicit `src` callsign parameter (not module state). `createDemodulator` encapsulates `demodBits`, `scanPos`, `sampleBuffer`, and `DPLL` state in a closure; state is not globally accessible.
+Key architectural decisions:
+- `buildFrame`/`buildFrameRaw` take an explicit `src` callsign parameter (not module state).
+- `createDemodulator` encapsulates `demodBits`, `scanPos`, `sampleBuffer`, and `DPLL` state in a closure; state is not globally accessible.
+- Application lifecycle is managed by a hand-rolled FSM (`src/fsm.js`). `transition()` is a pure function; all side effects are in `handleStateEntry()` in `main.js`.
+- File TX uses a pause gate: `sendFile` awaits a `Promise` between fragments; pause replaces it with a pending `Promise`, resume/cancel resolve it — no polling.
 
 ---
 
@@ -484,6 +488,10 @@ On page load `populateMicList()` does a temporary `getUserMedia` grant to read d
 | `chat-entry-rx` | RX message div (blue) |
 | `chat-entry-err` | Error message div (red) |
 | `chat-entry-file` | File transfer status div |
+| `xfer-progress` | File transfer progress panel (hidden when idle) |
+| `xfer-progress-bar` | Bootstrap progress bar fill element |
+| `pause-resume-btn` | Pause / Resume toggle button |
+| `cancel-xfer-btn` | Cancel transfer button |
 
 ---
 
@@ -505,6 +513,45 @@ On page load `populateMicList()` does a temporary `getUserMedia` grant to read d
 | `DPLL` | `src/dpll.js` |
 | `crc16`, `bitStuff`, `encodeCallsign`, `goertzel` | pure modules |
 | `MARK_FREQ`, `SPACE_FREQ`, `SAMPLE_RATE`, `SPB`, `STEP`, `PREAMBLE_FLAGS`, `POSTAMBLE_FLAGS` | `src/modulate.js` |
+| `togglePauseTx()` | Pause or resume the active file transfer |
+| `cancelTx()` | Cancel the active file transfer |
+
+---
+
+## FSM states and events
+
+`src/fsm.js` — pure `transition(state, event, context)` function; no side effects.
+
+### States
+
+| State | Meaning |
+|---|---|
+| `idle` | Page loaded, no audio running |
+| `requesting-mic` | `getUserMedia` in flight |
+| `mic-denied` | Microphone permission denied |
+| `initializing` | AudioContext + GPU/worklet setup in progress |
+| `running` | Audio active and demodulating |
+| `tx` | Transmitting — speaker busy, chat controls disabled |
+| `tx-paused` | Between TX fragments — speaker idle, chat re-enabled |
+| `stopping` | Teardown in progress |
+| `error` | Unrecoverable hardware failure |
+
+### Key transitions
+
+```
+idle         + START          → requesting-mic
+requesting-mic + MIC_GRANTED  → initializing
+initializing + HARDWARE_READY → running
+running      + START_TX       → tx
+tx           + PAUSE_TX       → tx-paused
+tx-paused    + RESUME_TX      → tx
+tx-paused    + CANCEL_TX      → running
+tx           + TX_DONE        → running
+running      + STOP           → stopping   (also valid from tx / tx-paused)
+stopping     + STOPPED        → idle
+```
+
+`isAudioActive(state)` returns true for `requesting-mic`, `initializing`, `running`, `tx`, `tx-paused`, `stopping`.
 
 ---
 
