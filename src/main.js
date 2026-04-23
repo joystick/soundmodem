@@ -7,7 +7,7 @@ import { createDemodulator } from './demodulate.js';
 import { compress, decompress } from './compress.js';
 import { deriveKey, encryptBytes as cryptoEncryptBytes, decryptBytes as cryptoDecryptBytes } from './crypto.js';
 import { GpuDemodulator, initWebGpu } from './gpu.js';
-import { addChat as addChatFn, populateMicList as populateMicListFn } from './ui.js';
+import { addChat as addChatFn, populateMicList as populateMicListFn, setAudioState } from './ui.js';
 
 // ── Runtime state ─────────────────────────────────────────────────────────
 let audioContext, micNode, scriptNode, isRunning = false;
@@ -15,7 +15,6 @@ let callsign = '', passphrase = '', cryptoKey = null;
 const incomingTransfers = new Map();
 
 const chatEl   = document.getElementById('chat');
-const statusEl = document.getElementById('status');
 
 let gpuDemodulator = null;
 let gpuQueue       = [];
@@ -301,18 +300,18 @@ async function toggleAudio() {
       micNode.connect(scriptNode);
       const silent = audioContext.createGain(); silent.gain.value = 0;
       scriptNode.connect(silent); silent.connect(audioContext.destination);
-      isRunning = true; statusEl.textContent = 'Running'; statusEl.style.color = 'green';
+      isRunning = true; setAudioState('running');
       populateMicList();
     } catch (e) {
       addChat(`Audio init failed: ${e.message}`, 'err');
-      statusEl.textContent = 'Error'; statusEl.style.color = 'red'; audioContext = null;
+      setAudioState('error'); audioContext = null;
     }
   } else {
     isRunning = false; scriptNode.disconnect(); await audioContext.close();
     audioContext = null; demodulator.reset();
     gpuDpll.reset(); gpuDemodBits = []; gpuScanPos = 0;
     gpuQueue = []; cryptoKey = null;
-    statusEl.textContent = 'Stopped'; statusEl.style.color = 'orange';
+    setAudioState('stopped');
   }
 }
 
