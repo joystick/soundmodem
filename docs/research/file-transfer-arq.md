@@ -63,6 +63,42 @@ fragment 1 (retransmit) ─────────────────►
            abort transfer, report failure
 ```
 
+### Implementation: Promise-based ACK gate
+
+The core mechanism is a Promise that `sendFile` awaits after transmitting each fragment.
+`receiveAck` (fired by the demodulator's `onAck` callback) resolves that Promise when
+a matching ACK arrives. A `setTimeout` resolves it with `false` on T1 expiry.
+
+```mermaid
+sequenceDiagram
+    participant SF as sendFile loop
+    participant WA as waitForAck
+    participant DM as Demodulator
+    participant RA as receiveAck
+
+    SF->>SF: playFrame(fragment)
+    SF->>WA: await waitForAck(xferId, seq)
+    Note over WA: creates Promise<br/>stores resolver in _ackResolve<br/>starts T1 setTimeout
+
+    alt ACK arrives before T1
+        DM->>RA: onAck(rawData)
+        RA->>RA: decodeAck → match xferId + seq?
+        RA->>WA: _ackResolve(true)
+        WA-->>SF: true (ACK received)
+        SF->>SF: next fragment
+    else T1 timeout
+        WA-->>SF: false (timeout)
+        SF->>SF: retransmit (attempt++)
+    else N2 exhausted
+        SF->>SF: abort transfer
+    end
+```
+
+The demodulator runs continuously — including during `S.TX` — so ACKs that arrive
+while a fragment is still playing are captured as soon as the frame is decoded.
+In OFDM mode, the worklet gate was widened from `S.RUNNING`-only to also include
+`S.TX` and `S.TX_PAUSED` to enable this.
+
 ### Parameters
 
 | Parameter | Value | Rationale |

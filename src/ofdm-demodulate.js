@@ -177,7 +177,7 @@ async function ofdmDemodulateWithGpu(samples, gpuDftFn, onStats) {
 // processChunk accepts a Float32Array of audio samples (any length).
 // A frame is decoded when a complete set of symbols has been received.
 // ---------------------------------------------------------------------------
-export function createOfdmDemodulator({ onMessage, onFilePacket, onStats = null, gpuDft = null, preferGpu = false }) {
+export function createOfdmDemodulator({ onMessage, onFilePacket, onAck = null, onStats = null, gpuDft = null, preferGpu = false }) {
   let sampleBuffer = new Float32Array(0);
   let resolvedGpu = gpuDft;       // GpuDft instance or null
   let gpuReady    = !!gpuDft;     // true once we know GPU state
@@ -202,6 +202,8 @@ export function createOfdmDemodulator({ onMessage, onFilePacket, onStats = null,
     if (bytes === null) return;
     if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) {
       if (onFilePacket) onFilePacket(bytes);
+    } else if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFD) {
+      if (onAck) onAck(bytes);
     } else {
       onMessage(new TextDecoder().decode(bytes));
     }
