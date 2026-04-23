@@ -9,7 +9,7 @@
     input, button, select { margin: 5px 0; padding: 8px; font-family: monospace; }
     #status { color: orange; font-weight: bold; }
     #demod-mode { font-size: 0.85em; margin-left: 10px; }
-    .tx { color: green; } .rx { color: blue; } .err { color: red; }
+    .tx { color: green; } .rx { color: blue; } .err { color: red; } .file { color: purple; }
   </style>
 </head>
 <body>
@@ -30,6 +30,9 @@
   <input id="message" data-testid="message-input" placeholder="Type message..."
          onkeypress="if(event.key==='Enter') sendMsg()">
   <button data-testid="send-btn" onclick="sendMsg()">Send</button>
+  <button data-testid="send-file-btn" onclick="document.getElementById('fileInput').click()">Send File</button>
+  <input type="file" id="fileInput" data-testid="file-input" style="display:none"
+         onchange="sendFile()">
 
   <script>
     // ── Bell 202 AFSK constants ────────────────────────────────────────────────
@@ -45,6 +48,11 @@
     // per estimate — ~9× oversampling of the symbol clock.  The DPLL consumes
     // these estimates and recovers the exact symbol boundaries.
     const STEP            = 4;   // samples between successive frequency estimates
+    // ── File transfer constants ────────────────────────────────────────────────
+    const FILE_MAGIC  = [0xFE, 0xFF];   // identifies a file-transfer packet in the data field
+    const CHUNK_SIZE  = 3500;           // bytes of (compressed) file data per fragment
+    const incomingTransfers = new Map();// xferKey → { total, fragments[], filename }
+
     const PREAMBLE_FLAGS  = 30;  // 0x7E repetitions prepended to every TX frame
     const POSTAMBLE_FLAGS = 4;   // 0x7E repetitions appended  (flush decoder)
 
@@ -275,6 +283,7 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
 
     let sampleBuffer = []; // CPU sliding-window sample accumulator
     let demodBits    = []; // recovered bits (both paths feed here)
+    let scanPos      = 0;  // how far into demodBits we've already scanned
     const dpll       = new DPLL();
 
     let gpuDemodulator = null;
@@ -363,15 +372,24 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
       return [0x7E, ...content, ...crc16(content), 0x7E];
     }
 
+    function buildFrameRaw(dataBytes, dst) {
+      const content = [...encodeCallsign(dst, false), ...encodeCallsign(callsign, true),
+                        0x03, 0xF0, ...dataBytes];
+      return [0x7E, ...content, ...crc16(content), 0x7E];
+    }
+
     // ── AES-GCM encryption ─────────────────────────────────────────────────────
+    async function ensureCryptoKey() {
+      if (cryptoKey || !passphrase) return;
+      const raw = await crypto.subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+      cryptoKey = await crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt: new Uint8Array(16), iterations: 100000, hash: 'SHA-256' },
+        raw, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    }
+
     async function encryptMsg(msg) {
       if (!passphrase) return msg;
-      if (!cryptoKey) {
-        const raw = await crypto.subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
-        cryptoKey = await crypto.subtle.deriveKey(
-          { name: 'PBKDF2', salt: new Uint8Array(16), iterations: 100000, hash: 'SHA-256' },
-          raw, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-      }
+      await ensureCryptoKey();
       const iv  = crypto.getRandomValues(new Uint8Array(12));
       const enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, new TextEncoder().encode(msg));
       return btoa(String.fromCharCode(...iv, ...new Uint8Array(enc)));
@@ -384,6 +402,49 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
         return new TextDecoder().decode(await crypto.subtle.decrypt(
           { name: 'AES-GCM', iv: b.slice(0, 12) }, cryptoKey, b.slice(12)));
       } catch { return '[decrypt failed]'; }
+    }
+
+    // Binary encrypt/decrypt for file packets (no base64 — stays as raw bytes)
+    async function encryptBytes(plainBytes) {
+      await ensureCryptoKey();
+      if (!cryptoKey) return plainBytes;
+      const iv  = crypto.getRandomValues(new Uint8Array(12));
+      const enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, plainBytes);
+      const out = new Uint8Array(12 + enc.byteLength);
+      out.set(iv); out.set(new Uint8Array(enc), 12);
+      return out;
+    }
+
+    async function decryptBytes(cipherBytes) {
+      await ensureCryptoKey();
+      if (!cryptoKey) return cipherBytes;
+      try {
+        return new Uint8Array(await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: cipherBytes.slice(0, 12) }, cryptoKey, cipherBytes.slice(12)));
+      } catch { return null; }
+    }
+
+    // Compress / decompress via browser DeflateRaw streams
+    async function compress(data) {
+      const cs = new CompressionStream('deflate-raw');
+      const writer = cs.writable.getWriter();
+      await writer.write(data); await writer.close();
+      const chunks = []; const reader = cs.readable.getReader();
+      for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); }
+      const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+      let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
+      return out;
+    }
+
+    async function decompress(data) {
+      const ds = new DecompressionStream('deflate-raw');
+      const writer = ds.writable.getWriter();
+      await writer.write(data); await writer.close();
+      const chunks = []; const reader = ds.readable.getReader();
+      for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); }
+      const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+      let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
+      return out;
     }
 
     // ── Modulator: bytes → AFSK Float32Array ──────────────────────────────────
@@ -476,12 +537,13 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
       const matchFlag = pos => FLAG.every((b, j) => demodBits[pos + j] === b);
       let consumed    = 0;
 
-      for (let i = 0; i + 8 <= demodBits.length; i++) {
+      // Start from where we last left off (-8 bits for safety at chunk boundaries)
+      for (let i = Math.max(0, scanPos - 8); i + 8 <= demodBits.length; i++) {
         if (!matchFlag(i)) continue;
         // Search for a valid closing flag.  Use `continue` (not break) on every
         // inner failure so false flags inside the data don't abort the search.
-        // Cap the scan at 4096 bits (512 B) to stay O(n) on garbage input.
-        for (let end = i + 64; end + 8 <= demodBits.length && end - i <= 4096; end++) {
+        // Cap the scan at 32768 bits (~4 KB) to support file transfer packets.
+        for (let end = i + 64; end + 8 <= demodBits.length && end - i <= 32768; end++) {
           if (!matchFlag(end)) continue;
           const frameBits = demodBits.slice(i + 8, end);
           const destuffed = []; let ones = 0, corrupt = false;
@@ -499,13 +561,22 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
           if (bytes.length < 3) continue;
           const [cH, cL] = bytes.slice(-2), [eH, eL] = crc16(bytes.slice(0, -2));
           if (cH !== eH || cL !== eL) continue;
-          const msg = new TextDecoder().decode(new Uint8Array(bytes.slice(16, -2)));
-          if (msg) receiveMsg(msg);
+          const data = new Uint8Array(bytes.slice(16, -2));
+          if (data.length >= 2 && data[0] === 0xFE && data[1] === 0xFF) {
+            receiveFilePacket(data); // async, fire-and-forget
+          } else {
+            const msg = new TextDecoder().decode(data);
+            if (msg) receiveMsg(msg);
+          }
           consumed = end + 8; i = end; break;
         }
       }
-      // Keep enough tail to span a full preamble + minimum frame across chunk boundaries
-      demodBits = demodBits.slice(Math.max(consumed, demodBits.length - 800));
+      // Keep enough tail for a full max-size frame (~32768 bits) plus preamble.
+      // Trim to 36000 bits so the outer loop only scans new bits each call.
+      const trimAt = Math.max(consumed, demodBits.length - 36000);
+      demodBits = demodBits.slice(trimAt);
+      // Adjust scanPos to account for the trim; advance to end of newly-scanned bits.
+      scanPos = Math.max(0, demodBits.length);
     }
 
     // ── Send / receive ─────────────────────────────────────────────────────────
@@ -530,6 +601,109 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
       addChat(`RX ${sep > 0 ? raw.slice(0, sep) : '?'}: ${
         passphrase ? await decryptMsg(sep > 0 ? raw.slice(sep + 1) : raw)
                    : (sep > 0 ? raw.slice(sep + 1) : raw)}`, 'rx');
+    }
+
+    // ── File transfer: send ────────────────────────────────────────────────────
+    function playFrame(frameBytes) {
+      return new Promise(resolve => {
+        const audioData = modulate(frameBytes);
+        const buf = audioContext.createBuffer(1, audioData.length, SAMPLE_RATE);
+        buf.getChannelData(0).set(audioData);
+        const src = audioContext.createBufferSource();
+        src.buffer = buf; src.connect(audioContext.destination);
+        src.onended = resolve; src.start();
+      });
+    }
+
+    async function sendFile() {
+      const fileInput = document.getElementById('fileInput');
+      const file = fileInput.files[0];
+      if (!file) return;
+      if (!callsign)     { alert('Enter callsign first'); return; }
+      if (!audioContext) { alert('Click "Start Audio" first'); return; }
+      fileInput.value = '';
+
+      await ensureCryptoKey();
+
+      addChat(`TX FILE ${file.name} — ${file.size} B, compressing…`, 'file');
+      const raw        = new Uint8Array(await file.arrayBuffer());
+      const compressed = await compress(raw);
+      const ratio      = (raw.length / compressed.length).toFixed(1);
+      addChat(`TX FILE ${file.name} — compressed ${raw.length}→${compressed.length} B (${ratio}×)`, 'file');
+
+      const xferId = crypto.getRandomValues(new Uint8Array(2));
+      const fname  = new TextEncoder().encode(file.name);
+      const total  = Math.max(1, Math.ceil(compressed.length / CHUNK_SIZE));
+
+      for (let seq = 0; seq < total; seq++) {
+        const chunkData = compressed.slice(seq * CHUNK_SIZE, (seq + 1) * CHUNK_SIZE);
+        const isFirst   = seq === 0;
+        const hdrSize   = 8 + (isFirst ? 2 + fname.length : 0);
+        const payload   = new Uint8Array(hdrSize + chunkData.length);
+        let p = 0;
+        payload[p++] = 0xFE; payload[p++] = 0xFF;          // magic
+        payload[p++] = xferId[0]; payload[p++] = xferId[1]; // transfer ID
+        payload[p++] = (seq >> 8) & 0xFF; payload[p++] = seq & 0xFF;   // seq
+        payload[p++] = (total >> 8) & 0xFF; payload[p++] = total & 0xFF; // total
+        if (isFirst) {
+          payload[p++] = (fname.length >> 8) & 0xFF;
+          payload[p++] = fname.length & 0xFF;
+          payload.set(fname, p); p += fname.length;
+        }
+        payload.set(chunkData, p);
+
+        const encrypted  = await encryptBytes(payload);
+        const frameBytes = buildFrameRaw(encrypted, 'ALL');
+        addChat(`TX FILE ${file.name} — fragment ${seq + 1}/${total} (${encrypted.length} B)`, 'file');
+        await playFrame(frameBytes);
+      }
+      addChat(`TX FILE ${file.name} — all ${total} fragment(s) sent`, 'file');
+    }
+
+    // ── File transfer: receive ─────────────────────────────────────────────────
+    async function receiveFilePacket(rawData) {
+      const payload = await decryptBytes(rawData);
+      if (!payload || payload.length < 8) return;
+      if (payload[0] !== 0xFE || payload[1] !== 0xFF) return;
+
+      const xferKey = payload[2].toString(16).padStart(2, '0') +
+                      payload[3].toString(16).padStart(2, '0');
+      const seq     = (payload[4] << 8) | payload[5];
+      const total   = (payload[6] << 8) | payload[7];
+
+      if (!incomingTransfers.has(xferKey)) {
+        incomingTransfers.set(xferKey, { total, filename: null, fragments: new Array(total) });
+      }
+      const xfer = incomingTransfers.get(xferKey);
+
+      let dataOffset = 8;
+      if (seq === 0) {
+        const fnameLen  = (payload[8] << 8) | payload[9];
+        xfer.filename   = new TextDecoder().decode(payload.slice(10, 10 + fnameLen));
+        dataOffset      = 10 + fnameLen;
+      }
+      xfer.fragments[seq] = payload.slice(dataOffset);
+
+      const received = xfer.fragments.filter(Boolean).length;
+      addChat(`RX FILE ${xfer.filename || '?'} — fragment ${seq + 1}/${total} (${received}/${total})`, 'file');
+
+      if (received === total && xfer.fragments.every(Boolean)) {
+        const combined = new Uint8Array(xfer.fragments.reduce((n, f) => n + f.length, 0));
+        let off = 0; for (const f of xfer.fragments) { combined.set(f, off); off += f.length; }
+
+        let decompressed;
+        try { decompressed = await decompress(combined); }
+        catch (e) { addChat(`RX FILE ${xfer.filename} — decompress failed: ${e.message}`, 'err'); return; }
+
+        const blob = new Blob([decompressed]);
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href = url; a.download = xfer.filename || 'received-file'; a.click();
+        URL.revokeObjectURL(url);
+
+        addChat(`RX FILE ${xfer.filename} — complete! ${decompressed.length} B — saved ↓`, 'file');
+        incomingTransfers.delete(xferKey);
+      }
     }
 
     function addChat(text, cls) {
@@ -567,7 +741,7 @@ fn main(@builtin(global_invocation_id) id : vec3<u32>) {
         }
       } else {
         isRunning = false; scriptNode.disconnect(); await audioContext.close();
-        audioContext = null; sampleBuffer = []; demodBits = [];
+        audioContext = null; sampleBuffer = []; demodBits = []; scanPos = 0;
         dpll.reset(); gpuQueue = [];
         statusEl.textContent = 'Stopped'; statusEl.style.color = 'orange';
       }

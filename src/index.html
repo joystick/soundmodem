@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SoundModem Chat</title>
+  <style>
+    body { font-family: monospace; max-width: 640px; margin: 0 auto; padding: 20px; }
+    #chat { height: 300px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px; background: #f9f9f9; }
+    input, button, select { margin: 5px 0; padding: 8px; font-family: monospace; }
+    #status { color: orange; font-weight: bold; }
+    #demod-mode { font-size: 0.85em; margin-left: 10px; }
+    .tx { color: green; } .rx { color: blue; } .err { color: red; } .file { color: purple; }
+  </style>
+</head>
+<body>
+  <h1>SoundModem P2P Chat</h1>
+  <label>Callsign (required):
+    <input id="callsign" data-testid="callsign-input" placeholder="e.g. TEST01" maxlength="6">
+  </label><br>
+  <label>Encryption Passphrase (optional):
+    <input id="passphrase" data-testid="passphrase-input" type="password" placeholder="shared secret">
+  </label><br>
+  <label>Microphone:
+    <select id="micSelect" data-testid="mic-select"><option value="">Default</option></select>
+  </label><br>
+  <button id="toggleBtn" data-testid="toggle-btn" onclick="toggleAudio()">Start Audio</button>
+  <span id="status" data-testid="status">Stopped</span>
+  <span id="demod-mode" data-testid="demod-mode"></span><br>
+  <div id="chat" data-testid="chat-log"></div>
+  <input id="message" data-testid="message-input" placeholder="Type message..."
+         onkeypress="if(event.key==='Enter') sendMsg()">
+  <button data-testid="send-btn" onclick="sendMsg()">Send</button>
+  <button data-testid="send-file-btn" onclick="document.getElementById('fileInput').click()">Send File</button>
+  <input type="file" id="fileInput" data-testid="file-input" style="display:none"
+         onchange="sendFile()">
+
+  <!-- BUNDLE -->
+</body>
+</html>
