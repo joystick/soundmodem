@@ -25,6 +25,14 @@ let _pauseGate    = Promise.resolve();
 let _pauseResolve = null;  // resolver for the current gate; null when not paused
 let _cancelXfer   = false; // set true by cancelTx() to break the send loop
 
+// ── ARQ state ────────────────────────────────────────────────────────────
+let _ackResolve     = null;  // resolves waitForAck promise; null when not waiting
+let _pendingAckId   = null;  // xferId hex string we're waiting for
+let _pendingAckSeq  = null;  // seq number we're waiting for
+const T1_BELL202    = 5000;  // retransmit timeout (ms) — Bell 202
+const T1_OFDM       = 2000;  // retransmit timeout (ms) — OFDM
+const N2_MAX        = 5;     // max retransmit attempts per fragment
+
 // ── Runtime state ─────────────────────────────────────────────────────────
 let audioContext, micNode, scriptNode;
 let _micStream = null; // held between requesting-mic → initializing
@@ -276,24 +284,45 @@ async function sendFile() {
     const ratio      = (raw.length / compressed.length).toFixed(1);
     addChat(`TX FILE ${file.name} — compressed ${raw.length}→${compressed.length} B (${ratio}×)`, 'file');
 
-    const xferId = crypto.getRandomValues(new Uint8Array(2));
-    const total  = Math.max(1, Math.ceil(compressed.length / CHUNK_SIZE));
+    const xferId    = crypto.getRandomValues(new Uint8Array(2));
+    const xferIdHex = xferId[0].toString(16).padStart(2, '0') +
+                      xferId[1].toString(16).padStart(2, '0');
+    const total     = Math.max(1, Math.ceil(compressed.length / CHUNK_SIZE));
+    let totalRetransmits = 0;
     updateXferProgress(file.name, 0, total);
 
     for (let seq = 0; seq < total; seq++) {
-      // Wait if paused (resolves immediately when running); bail if cancelled
-      await _pauseGate;
-      if (_cancelXfer) break;
-
       const data    = compressed.slice(seq * CHUNK_SIZE, (seq + 1) * CHUNK_SIZE);
       const payload = encodePacket({ xferId, seq, total, filename: seq === 0 ? file.name : undefined, data });
-
       const encrypted = await encryptBytesLocal(payload);
 
-      if (fsmContext.mode === 'ofdm') {
-        await playOfdmFrame(encrypted);
-      } else {
-        await playFrame(buildFrameRaw(encrypted, 'ALL', callsign));
+      let acked = false;
+      for (let attempt = 0; attempt <= N2_MAX; attempt++) {
+        // Wait if paused; bail if cancelled
+        await _pauseGate;
+        if (_cancelXfer) break;
+
+        if (attempt > 0) {
+          totalRetransmits++;
+          addChat(`TX FILE ${file.name} — retransmit fragment ${seq + 1}/${total} (attempt ${attempt + 1}/${N2_MAX + 1})`, 'file');
+        }
+
+        // Transmit fragment
+        if (fsmContext.mode === 'ofdm') {
+          await playOfdmFrame(encrypted);
+        } else {
+          await playFrame(buildFrameRaw(encrypted, 'ALL', callsign));
+        }
+
+        // Wait for ACK
+        acked = await waitForAck(xferIdHex, seq);
+        if (acked) break;
+      }
+
+      if (_cancelXfer) break;
+      if (!acked) {
+        addChat(`TX FILE ${file.name} — fragment ${seq + 1}/${total} failed after ${N2_MAX + 1} attempts, aborting`, 'err');
+        break;
       }
 
       updateXferProgress(file.name, seq + 1, total);
@@ -302,15 +331,18 @@ async function sendFile() {
     if (_cancelXfer) {
       addChat(`TX FILE ${file.name} — cancelled`, 'file');
     } else {
-      addChat(`TX FILE ${file.name} — all ${total} fragment(s) sent`, 'file');
+      addChat(`TX FILE ${file.name} — all ${total} fragment(s) delivered (${totalRetransmits} retransmit${totalRetransmits !== 1 ? 's' : ''})`, 'file');
     }
   } catch (err) {
     addChat(`TX FILE ${file.name} — error: ${err.message}`, 'err');
     console.error('sendFile error:', err);
   } finally {
-    _cancelXfer   = false;
-    _pauseResolve = null;
-    _pauseGate    = Promise.resolve();
+    _cancelXfer    = false;
+    _pauseResolve  = null;
+    _pauseGate     = Promise.resolve();
+    _ackResolve    = null;
+    _pendingAckId  = null;
+    _pendingAckSeq = null;
     dispatch({ type: E.TX_DONE });
   }
 }
@@ -344,11 +376,27 @@ function cancelTx() {
 }
 
 // ── ACK receive handler (wired to demodulators) ──────────────────────────
-// Placeholder for Phase 3 — will resolve the stop-and-wait promise.
 function receiveAck(rawData) {
   const ack = decodeAck(rawData);
   if (!ack) return;
-  addChat(`RX ACK xfer=${ack.xferId} seq=${ack.seq}`, 'file');
+  // If this matches what sendFile is waiting for, resolve the gate
+  if (_ackResolve && ack.xferId === _pendingAckId && ack.seq === _pendingAckSeq) {
+    _ackResolve(true);
+    _ackResolve = null;
+  }
+}
+
+/** Wait for a matching ACK or timeout. Returns true if ACK received, false on timeout. */
+function waitForAck(xferIdHex, seq) {
+  const t1 = fsmContext.mode === 'ofdm' ? T1_OFDM : T1_BELL202;
+  _pendingAckId  = xferIdHex;
+  _pendingAckSeq = seq;
+  return new Promise(resolve => {
+    _ackResolve = resolve;
+    setTimeout(() => {
+      if (_ackResolve === resolve) { _ackResolve = null; resolve(false); }
+    }, t1);
+  });
 }
 
 async function receiveFilePacket(rawData) {
@@ -587,7 +635,8 @@ registerProcessor('ofdm-processor', OfdmProcessor);`;
 
     ofdmWorkletNode = new AudioWorkletNode(audioContext, 'ofdm-processor');
     ofdmWorkletNode.port.onmessage = e => {
-      if (fsmState === S.RUNNING) ofdmDemodInstance.processChunk(e.data);
+      if (fsmState === S.RUNNING || fsmState === S.TX || fsmState === S.TX_PAUSED)
+        ofdmDemodInstance.processChunk(e.data);
     };
     micNode.connect(ofdmWorkletNode);
     const silent = audioContext.createGain(); silent.gain.value = 0;
