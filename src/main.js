@@ -9,7 +9,7 @@ import { deriveKey, encryptBytes as cryptoEncryptBytes, decryptBytes as cryptoDe
 import { GpuDemodulator, initWebGpu, getSharedGpuDevice } from './gpu.js';
 import { addChat as addChatFn, populateMicList as populateMicListFn } from './ui.js';
 import { ofdmEncodeFrame, ofdmEncodeFrameRaw } from './ofdm.js';
-import { encodePacket, decodePacket, CHUNK_SIZE } from './packet.js';
+import { encodePacket, decodePacket, CHUNK_SIZE, encodeAck, decodeAck } from './packet.js';
 import { createOfdmDemodulator } from './ofdm-demodulate.js';
 import { initGpuDft } from './ofdm-gpu.js';
 import { S, E, transition, isAudioActive } from './fsm.js';
@@ -88,6 +88,7 @@ async function decryptBytesLocal(cipherBytes) {
 const demodulator = createDemodulator({
   onMessage: receiveMsg,
   onFilePacket: receiveFilePacket,
+  onAck: receiveAck,
 });
 
 function consumeIsMarkArray(isMarkArr) {
@@ -215,6 +216,21 @@ async function receiveMsg(raw) {
                : (sep > 0 ? raw.slice(sep + 1) : raw)}`, 'rx');
 }
 
+// ── File transfer: send ACK ───────────────────────────────────────────────
+async function sendAck(xferIdBytes, seq) {
+  try {
+    const ackPkt   = encodeAck({ xferId: xferIdBytes, seq });
+    const encrypted = await encryptBytesLocal(ackPkt);
+    if (fsmContext.mode === 'ofdm') {
+      await playOfdmFrame(encrypted);
+    } else {
+      await playFrame(buildFrameRaw(encrypted, 'ALL', callsign));
+    }
+  } catch (err) {
+    console.error('sendAck error:', err);
+  }
+}
+
 // ── File transfer: play frame ──────────────────────────────────────────────
 function playFrame(frameBytes) {
   return new Promise(resolve => {
@@ -327,6 +343,14 @@ function cancelTx() {
   // _cancelXfer will break the loop before the next fragment starts.
 }
 
+// ── ACK receive handler (wired to demodulators) ──────────────────────────
+// Placeholder for Phase 3 — will resolve the stop-and-wait promise.
+function receiveAck(rawData) {
+  const ack = decodeAck(rawData);
+  if (!ack) return;
+  addChat(`RX ACK xfer=${ack.xferId} seq=${ack.seq}`, 'file');
+}
+
 async function receiveFilePacket(rawData) {
   const decrypted = await decryptBytesLocal(rawData);
   const pkt = decodePacket(decrypted);
@@ -342,6 +366,9 @@ async function receiveFilePacket(rawData) {
 
   const received = xfer.fragments.filter(Boolean).length;
   addChat(`RX FILE ${xfer.filename || '?'} — fragment ${seq + 1}/${total} (${received}/${total})`, 'file');
+
+  // Send ACK back to sender — grab raw xferId bytes from the decrypted packet
+  sendAck(decrypted.slice(2, 4), seq);
 
   if (received === total && xfer.fragments.every(Boolean)) {
     const combined = new Uint8Array(xfer.fragments.reduce((n, f) => n + f.length, 0));
@@ -537,6 +564,7 @@ registerProcessor('ofdm-processor', OfdmProcessor);`;
     ofdmDemodInstance = createOfdmDemodulator({
       onMessage:    receiveMsg,
       onFilePacket: receiveFilePacket,
+      onAck:        receiveAck,
       gpuDft:       gpuDftInst,
       onStats: ({ snrDb, phaseErrRad }) => {
         if (fsmState !== S.RUNNING) return;

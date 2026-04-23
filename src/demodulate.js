@@ -6,7 +6,7 @@ const SPACE_FREQ = 2200;
 const SPB        = 36;
 const STEP       = 4;
 
-export function createDemodulator({ onMessage, onFilePacket } = {}) {
+export function createDemodulator({ onMessage, onFilePacket, onAck } = {}) {
   let demodBits   = [];
   let sampleBuffer = [];
   let scanPos     = 0;
@@ -54,7 +54,9 @@ export function createDemodulator({ onMessage, onFilePacket } = {}) {
 
         const data = new Uint8Array(bytes.slice(16, -2));
         if (data.length >= 2 && data[0] === 0xFE && data[1] === 0xFF) {
-          if (onFilePacket) onFilePacket(data); // async, fire-and-forget
+          if (onFilePacket) onFilePacket(data);
+        } else if (data.length >= 2 && data[0] === 0xFE && data[1] === 0xFD) {
+          if (onAck) onAck(data);
         } else {
           const msg = new TextDecoder().decode(data);
           if (msg && onMessage) onMessage(msg);

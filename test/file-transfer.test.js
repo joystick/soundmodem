@@ -4,7 +4,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { compress, decompress } from '../src/compress.js';
-import { encodePacket, decodePacket, CHUNK_SIZE, FILE_MAGIC } from '../src/packet.js';
+import { encodePacket, decodePacket, CHUNK_SIZE, FILE_MAGIC, encodeAck, decodeAck } from '../src/packet.js';
 import { buildFrameRaw } from '../src/ax25.js';
 import { modulate } from '../src/modulate.js';
 import { createDemodulator } from '../src/demodulate.js';
@@ -150,4 +150,46 @@ describe('compress → encodePacket → decodePacket → decompress', () => {
 
     expect(new TextDecoder().decode(restored)).toBe(new TextDecoder().decode(original));
   });
+});
+
+// ── ACK routing through demodulators ─────────────────────────────────────────
+
+describe('Bell 202 ACK routing', () => {
+  it('routes ACK packets to onAck callback', () => {
+    const ackPkt = encodeAck({ xferId: new Uint8Array([0x12, 0x34]), seq: 7 });
+    const acks = [];
+    const dem = createDemodulator({
+      onMessage: () => {},
+      onFilePacket: () => {},
+      onAck: pkt => acks.push(pkt),
+    });
+
+    feedBell202(dem, modulate(buildFrameRaw(ackPkt, 'ALL', 'TEST01')));
+
+    expect(acks.length).toBeGreaterThan(0);
+    const dec = decodeAck(acks[0]);
+    expect(dec).not.toBeNull();
+    expect(dec.xferId).toBe('1234');
+    expect(dec.seq).toBe(7);
+  }, 30000);
+});
+
+describe('OFDM ACK routing', () => {
+  it('routes ACK packets to onAck callback', () => {
+    const ackPkt = encodeAck({ xferId: new Uint8Array([0xAB, 0xCD]), seq: 3 });
+    const acks = [];
+    const dem = createOfdmDemodulator({
+      onMessage: () => {},
+      onFilePacket: () => {},
+      onAck: pkt => acks.push(pkt),
+    });
+
+    feedOfdm(dem, ofdmEncodeFrameRaw(ackPkt));
+
+    expect(acks.length).toBeGreaterThan(0);
+    const dec = decodeAck(acks[0]);
+    expect(dec).not.toBeNull();
+    expect(dec.xferId).toBe('abcd');
+    expect(dec.seq).toBe(3);
+  }, 30000);
 });
