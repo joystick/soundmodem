@@ -352,9 +352,9 @@ registerProcessor('ofdm-processor', OfdmProcessor);`;
           ctx.fillText(label, 3, h - 3);
         }
 
-        // EMA state + history buffers for sparklines (60 pts ≈ ~10 s at typical frame rate)
-        const STATS_ALPHA = 0.15, HISTORY_LEN = 60;
-        let smoothSnr = null, smoothPhase = null;
+        // EMA state + history buffers for sparklines (60 pts × 500 ms = 30 s window)
+        const STATS_ALPHA = 0.15, HISTORY_LEN = 60, GRAPH_INTERVAL_MS = 500;
+        let smoothSnr = null, smoothPhase = null, lastGraphUpdate = 0;
         const snrHistory = [], phaseHistory = [];
         ofdmDemodInstance = createOfdmDemodulator({
           onMessage: receiveMsg,
@@ -364,6 +364,10 @@ registerProcessor('ofdm-processor', OfdmProcessor);`;
             if (!isRunning) return; // discard late GPU callbacks after stop
             smoothSnr   = smoothSnr   === null ? snrDb       : smoothSnr   + STATS_ALPHA * (snrDb       - smoothSnr);
             smoothPhase = smoothPhase === null ? phaseErrRad : smoothPhase + STATS_ALPHA * (phaseErrRad - smoothPhase);
+            // Throttle graph updates: one new point per 500 ms → 60 pts = 30 s window
+            const now = Date.now();
+            if (now - lastGraphUpdate < GRAPH_INTERVAL_MS) return;
+            lastGraphUpdate = now;
             snrHistory.push(smoothSnr);     if (snrHistory.length   > HISTORY_LEN) snrHistory.shift();
             phaseHistory.push(smoothPhase); if (phaseHistory.length > HISTORY_LEN) phaseHistory.shift();
             const snrLabel   = `SNR ${Math.min(Math.max(smoothSnr, -9.9), 99.9).toFixed(1)} dB`;
