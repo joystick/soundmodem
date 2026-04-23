@@ -7,15 +7,20 @@ import { createDemodulator } from './demodulate.js';
 import { compress, decompress } from './compress.js';
 import { deriveKey, encryptBytes as cryptoEncryptBytes, decryptBytes as cryptoDecryptBytes } from './crypto.js';
 import { GpuDemodulator, initWebGpu, getSharedGpuDevice } from './gpu.js';
-import { addChat as addChatFn, populateMicList as populateMicListFn, setAudioState } from './ui.js';
-import { ofdmEncodeFrame, OFDM_INTERLEAVE_DEPTH } from './ofdm.js';
+import { addChat as addChatFn, populateMicList as populateMicListFn } from './ui.js';
+import { ofdmEncodeFrame } from './ofdm.js';
 import { createOfdmDemodulator } from './ofdm-demodulate.js';
 import { initGpuDft } from './ofdm-gpu.js';
+import { S, E, transition, isAudioActive } from './fsm.js';
+
+// ── FSM state ─────────────────────────────────────────────────────────────
+let fsmState   = S.IDLE;
+let fsmContext = { mode: 'bell202', errorMessage: null };
 
 // ── Runtime state ─────────────────────────────────────────────────────────
-let audioContext, micNode, scriptNode, isRunning = false;
+let audioContext, micNode, scriptNode;
+let _micStream = null; // held between requesting-mic → initializing
 let callsign = '', passphrase = '', cryptoKey = null;
-let modemMode = 'bell202'; // 'bell202' | 'ofdm'
 let ofdmWorkletNode = null;
 let ofdmDemodInstance = null;
 const incomingTransfers = new Map();
@@ -32,9 +37,9 @@ function addChat(text, cls) {
 }
 
 function setModemMode(mode) {
-  modemMode = mode;
-  document.getElementById('modemMode').value = mode;
-  localStorage.setItem('modemMode', mode);
+  dispatch({ type: E.MODE_CHANGE, mode });
+  document.getElementById('modemMode').value = fsmContext.mode;
+  localStorage.setItem('modemMode', fsmContext.mode);
 }
 
 async function ensureCryptoKey() {
@@ -171,7 +176,7 @@ async function sendMsg() {
   if (!audioContext) { alert('Click "Start Audio" first'); return; }
   msgEl.value = '';
   let audioData;
-  if (modemMode === 'ofdm') {
+  if (fsmContext.mode === 'ofdm') {
     audioData = ofdmEncodeFrame(`${callsign}>${await encryptMsg(msg)}`);
   } else {
     const frameBytes = buildFrame(`${callsign}>${await encryptMsg(msg)}`, 'ALL', callsign);
@@ -298,28 +303,114 @@ async function populateMicList() {
   await populateMicListFn(document.getElementById('micSelect'));
 }
 
-// ── Audio toggle ───────────────────────────────────────────────────────────
-async function toggleAudio() {
-  callsign   = document.getElementById('callsign').value.trim().toUpperCase();
-  passphrase = document.getElementById('passphrase').value;
-  if (!callsign) { alert('Enter callsign'); return; }
-  localStorage.setItem('callsign', callsign);
+// ── FSM: dispatch + render + side effects ─────────────────────────────────
 
-  if (!isRunning) {
-    try {
-      audioContext   = new AudioContext({ sampleRate: SAMPLE_RATE });
+function dispatch(event) {
+  const next = transition(fsmState, event, fsmContext);
+  if (next.state === fsmState && next.context === fsmContext) return;
+  fsmState   = next.state;
+  fsmContext = next.context;
+  renderState(fsmState, fsmContext);
+  handleStateEntry(fsmState, fsmContext);
+}
+
+function renderState(state, context) {
+  const btn      = document.getElementById('toggleBtn');
+  const demodEl  = document.getElementById('demod-mode');
+  const snrEl    = document.getElementById('ofdm-snr');
+  const phaseEl  = document.getElementById('ofdm-phase-err');
+  const statusEl = document.getElementById('status');
+
+  // Toggle button
+  const busy = state === S.REQUESTING_MIC || state === S.INITIALIZING || state === S.STOPPING;
+  if (state === S.RUNNING) {
+    btn.textContent = '⏹ Stop Audio';
+    btn.className   = 'btn btn-sm btn-outline-danger';
+    btn.disabled    = false;
+  } else if (busy) {
+    btn.textContent = '⏳ …';
+    btn.className   = 'btn btn-sm btn-outline-secondary';
+    btn.disabled    = true;
+  } else {
+    btn.textContent = '▶ Start Audio';
+    btn.className   = 'btn btn-sm btn-outline-success';
+    btn.disabled    = false;
+  }
+
+  // Disable inputs while audio is active
+  const active = isAudioActive(state);
+  for (const id of ['modemMode', 'callsign', 'passphrase', 'micSelect'])
+    document.getElementById(id).disabled = active;
+
+  // Status badge
+  const statusMap = {
+    [S.IDLE]:           ['Stopped',    'bg-warning text-dark'],
+    [S.REQUESTING_MIC]: ['Mic…',       'bg-info text-dark'],
+    [S.MIC_DENIED]:     ['Mic denied', 'bg-danger text-light'],
+    [S.INITIALIZING]:   ['Init…',      'bg-info text-dark'],
+    [S.RUNNING]:        ['Running',    'bg-success text-light'],
+    [S.STOPPING]:       ['Stopping…',  'bg-warning text-dark'],
+    [S.ERROR]:          ['Error',      'bg-danger text-light'],
+  };
+  const [label, cls] = statusMap[state] || statusMap[S.IDLE];
+  statusEl.textContent = label;
+  statusEl.className   = `badge rounded-pill ${cls}`;
+
+  // OFDM graphs — only while running in OFDM mode
+  if (state !== S.RUNNING || context.mode !== 'ofdm') {
+    snrEl.classList.add('d-none');
+    phaseEl.classList.add('d-none');
+  }
+  if (state !== S.RUNNING) demodEl.textContent = '';
+}
+
+async function handleStateEntry(state, context) {
+  switch (state) {
+
+    case S.REQUESTING_MIC: {
       const deviceId = document.getElementById('micSelect').value;
-      const stream   = await navigator.mediaDevices.getUserMedia({
-        audio: deviceId ? { deviceId: { exact: deviceId } } : true,
-      });
-      micNode = audioContext.createMediaStreamSource(stream);
+      try {
+        _micStream = await navigator.mediaDevices.getUserMedia({
+          audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+        });
+        dispatch({ type: E.MIC_GRANTED });
+      } catch (err) {
+        addChat(`Mic access denied: ${err.message}`, 'err');
+        dispatch({ type: E.MIC_DENIED });
+      }
+      break;
+    }
 
-      if (modemMode === 'ofdm') {
-        // OFDM-HF path: AudioWorklet relays samples → main thread OFDM demodulator
-        const gpuDftInst = await getGpuDft(); // null if WebGPU unavailable
-        // Inline the worklet as a Blob URL so the single-file dist works without
-        // a separate /src/ofdm-worklet.js being served alongside index.html.
-        const workletSrc = `class OfdmProcessor extends AudioWorkletProcessor {
+    case S.INITIALIZING: {
+      try {
+        await initAudioHardware(context);
+        dispatch({ type: E.HARDWARE_READY });
+        populateMicList();
+      } catch (err) {
+        addChat(`Audio init failed: ${err.message}`, 'err');
+        await teardownAudio();
+        dispatch({ type: E.HARDWARE_ERROR, message: err.message });
+      }
+      break;
+    }
+
+    case S.STOPPING: {
+      await teardownAudio();
+      dispatch({ type: E.STOPPED });
+      break;
+    }
+  }
+}
+
+// ── Hardware init / teardown ───────────────────────────────────────────────
+
+async function initAudioHardware(context) {
+  audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+  micNode      = audioContext.createMediaStreamSource(_micStream);
+
+  if (context.mode === 'ofdm') {
+    const gpuDftInst = await getGpuDft();
+    const workletSrc = `class OfdmProcessor extends AudioWorkletProcessor {
   process(inputs) {
     const ch = inputs[0] && inputs[0][0];
     if (ch && ch.length > 0) this.port.postMessage(ch.slice());
@@ -327,94 +418,96 @@ async function toggleAudio() {
   }
 }
 registerProcessor('ofdm-processor', OfdmProcessor);`;
-        const workletUrl = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
-        await audioContext.audioWorklet.addModule(workletUrl);
-        URL.revokeObjectURL(workletUrl);
-        // Sparkline helper — draws a scrolling line graph on a canvas element.
-        // history: number[], min/max: display range, color: CSS color string, label: text overlay
-        function drawSparkline(canvas, history, { min, max, color, label }) {
-          const ctx = canvas.getContext('2d');
-          const w = canvas.width, h = canvas.height;
-          ctx.clearRect(0, 0, w, h);
-          ctx.fillStyle = 'rgba(0,0,0,0.45)';
-          ctx.beginPath(); ctx.roundRect(0, 0, w, h, 4); ctx.fill();
-          if (history.length >= 2) {
-            ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
-            ctx.beginPath();
-            history.forEach((v, i) => {
-              const x = (i / (history.length - 1)) * w;
-              const y = h - ((Math.min(Math.max(v, min), max) - min) / (max - min)) * (h - 4) - 2;
-              i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-            });
-            ctx.stroke();
-          }
-          ctx.fillStyle = color; ctx.font = 'bold 9px monospace';
-          ctx.fillText(label, 3, h - 3);
-        }
+    const workletUrl = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
+    await audioContext.audioWorklet.addModule(workletUrl);
+    URL.revokeObjectURL(workletUrl);
 
-        // EMA state + history buffers for sparklines (60 pts × 500 ms = 30 s window)
-        const STATS_ALPHA = 0.15, HISTORY_LEN = 120, GRAPH_INTERVAL_MS = 500;
-        let smoothSnr = null, smoothPhase = null, lastGraphUpdate = 0;
-        const snrHistory = [], phaseHistory = [];
-        ofdmDemodInstance = createOfdmDemodulator({
-          onMessage: receiveMsg,
-          onFilePacket: receiveFilePacket,
-          gpuDft: gpuDftInst,
-          onStats: ({ snrDb, phaseErrRad }) => {
-            if (!isRunning) return; // discard late GPU callbacks after stop
-            smoothSnr   = smoothSnr   === null ? snrDb       : smoothSnr   + STATS_ALPHA * (snrDb       - smoothSnr);
-            smoothPhase = smoothPhase === null ? phaseErrRad : smoothPhase + STATS_ALPHA * (phaseErrRad - smoothPhase);
-            // Throttle graph updates: one new point per 500 ms → 60 pts = 30 s window
-            const now = Date.now();
-            if (now - lastGraphUpdate < GRAPH_INTERVAL_MS) return;
-            lastGraphUpdate = now;
-            snrHistory.push(smoothSnr);     if (snrHistory.length   > HISTORY_LEN) snrHistory.shift();
-            phaseHistory.push(smoothPhase); if (phaseHistory.length > HISTORY_LEN) phaseHistory.shift();
-            const snrLabel   = `SNR ${Math.min(Math.max(smoothSnr, -9.9), 99.9).toFixed(1)} dB`;
-            const phaseLabel = `φ ${(smoothPhase * 180 / Math.PI).toFixed(1)}°`;
-            drawSparkline(document.getElementById('ofdm-snr-graph'),   snrHistory,   { min: -10, max: 30,  color: '#0dcaf0', label: snrLabel });
-            drawSparkline(document.getElementById('ofdm-phase-graph'), phaseHistory, { min: -Math.PI, max: Math.PI, color: '#adb5bd', label: phaseLabel });
-          },
+    function drawSparkline(canvas, history, { min, max, color, label }) {
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width, h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.beginPath(); ctx.roundRect(0, 0, w, h, 4); ctx.fill();
+      if (history.length >= 2) {
+        ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
+        ctx.beginPath();
+        history.forEach((v, i) => {
+          const x = (i / (history.length - 1)) * w;
+          const y = h - ((Math.min(Math.max(v, min), max) - min) / (max - min)) * (h - 4) - 2;
+          i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
         });
-        // Show graphs immediately when OFDM starts (they draw as data arrives)
-        document.getElementById('ofdm-snr').classList.remove('d-none');
-        document.getElementById('ofdm-phase-err').classList.remove('d-none');
-        ofdmWorkletNode = new AudioWorkletNode(audioContext, 'ofdm-processor');
-        ofdmWorkletNode.port.onmessage = e => {
-          if (isRunning) ofdmDemodInstance.processChunk(e.data);
-        };
-        micNode.connect(ofdmWorkletNode);
-        const silent = audioContext.createGain(); silent.gain.value = 0;
-        ofdmWorkletNode.connect(silent); silent.connect(audioContext.destination);
-        document.getElementById('demod-mode').textContent = gpuDftInst ? 'OFDM-GPU' : 'OFDM-CPU';
-      } else {
-        // Bell 202 path: legacy ScriptProcessor → GPU or CPU Goertzel
-        scriptNode = audioContext.createScriptProcessor(4096, 1, 1);
-        scriptNode.onaudioprocess = e => { if (isRunning) processAudioChunk(e.inputBuffer.getChannelData(0)); };
-        micNode.connect(scriptNode);
-        const silent = audioContext.createGain(); silent.gain.value = 0;
-        scriptNode.connect(silent); silent.connect(audioContext.destination);
+        ctx.stroke();
       }
-
-      isRunning = true; setAudioState('running');
-      populateMicList();
-    } catch (e) {
-      addChat(`Audio init failed: ${e.message}`, 'err');
-      setAudioState('error'); audioContext = null;
+      ctx.fillStyle = color; ctx.font = 'bold 9px monospace';
+      ctx.fillText(label, 3, h - 3);
     }
+
+    const STATS_ALPHA = 0.15, HISTORY_LEN = 120, GRAPH_INTERVAL_MS = 500;
+    let smoothSnr = null, smoothPhase = null, lastGraphUpdate = 0;
+    const snrHistory = [], phaseHistory = [];
+
+    ofdmDemodInstance = createOfdmDemodulator({
+      onMessage:    receiveMsg,
+      onFilePacket: receiveFilePacket,
+      gpuDft:       gpuDftInst,
+      onStats: ({ snrDb, phaseErrRad }) => {
+        if (fsmState !== S.RUNNING) return;
+        smoothSnr   = smoothSnr   === null ? snrDb       : smoothSnr   + STATS_ALPHA * (snrDb       - smoothSnr);
+        smoothPhase = smoothPhase === null ? phaseErrRad : smoothPhase + STATS_ALPHA * (phaseErrRad - smoothPhase);
+        const now = Date.now();
+        if (now - lastGraphUpdate < GRAPH_INTERVAL_MS) return;
+        lastGraphUpdate = now;
+        snrHistory.push(smoothSnr);     if (snrHistory.length   > HISTORY_LEN) snrHistory.shift();
+        phaseHistory.push(smoothPhase); if (phaseHistory.length > HISTORY_LEN) phaseHistory.shift();
+        const snrLabel   = `SNR ${Math.min(Math.max(smoothSnr, -9.9), 99.9).toFixed(1)} dB`;
+        const phaseLabel = `φ ${(smoothPhase * 180 / Math.PI).toFixed(1)}°`;
+        drawSparkline(document.getElementById('ofdm-snr-graph'),   snrHistory,   { min: -10, max: 30,       color: '#0dcaf0', label: snrLabel });
+        drawSparkline(document.getElementById('ofdm-phase-graph'), phaseHistory, { min: -Math.PI, max: Math.PI, color: '#adb5bd', label: phaseLabel });
+      },
+    });
+
+    document.getElementById('ofdm-snr').classList.remove('d-none');
+    document.getElementById('ofdm-phase-err').classList.remove('d-none');
+
+    ofdmWorkletNode = new AudioWorkletNode(audioContext, 'ofdm-processor');
+    ofdmWorkletNode.port.onmessage = e => {
+      if (fsmState === S.RUNNING) ofdmDemodInstance.processChunk(e.data);
+    };
+    micNode.connect(ofdmWorkletNode);
+    const silent = audioContext.createGain(); silent.gain.value = 0;
+    ofdmWorkletNode.connect(silent); silent.connect(audioContext.destination);
+    document.getElementById('demod-mode').textContent = gpuDftInst ? 'OFDM-GPU' : 'OFDM-CPU';
+
   } else {
-    isRunning = false;
-    if (scriptNode) scriptNode.disconnect();
-    if (ofdmWorkletNode) { ofdmWorkletNode.disconnect(); ofdmWorkletNode = null; }
-    if (ofdmDemodInstance) { ofdmDemodInstance.reset(); ofdmDemodInstance = null; }
-    await audioContext.close();
-    audioContext = null; demodulator.reset();
-    gpuDpll.reset(); gpuDemodBits = []; gpuScanPos = 0;
-    gpuQueue = []; cryptoKey = null;
-    document.getElementById('demod-mode').textContent = '';
-    document.getElementById('ofdm-snr').classList.add('d-none');
-    document.getElementById('ofdm-phase-err').classList.add('d-none');
-    setAudioState('stopped');
+    scriptNode = audioContext.createScriptProcessor(4096, 1, 1);
+    scriptNode.onaudioprocess = e => { if (fsmState === S.RUNNING) processAudioChunk(e.inputBuffer.getChannelData(0)); };
+    micNode.connect(scriptNode);
+    const silent = audioContext.createGain(); silent.gain.value = 0;
+    scriptNode.connect(silent); silent.connect(audioContext.destination);
+  }
+}
+
+async function teardownAudio() {
+  if (scriptNode)      { scriptNode.disconnect();      scriptNode      = null; }
+  if (ofdmWorkletNode) { ofdmWorkletNode.disconnect(); ofdmWorkletNode = null; }
+  if (ofdmDemodInstance) { ofdmDemodInstance.reset();  ofdmDemodInstance = null; }
+  if (audioContext)    { await audioContext.close();   audioContext    = null; }
+  if (_micStream)      { _micStream.getTracks().forEach(t => t.stop()); _micStream = null; }
+  demodulator.reset();
+  gpuDpll.reset(); gpuDemodBits = []; gpuScanPos = 0;
+  gpuQueue = []; cryptoKey = null;
+}
+
+// ── Audio toggle (called from HTML onclick) ────────────────────────────────
+function toggleAudio() {
+  if (fsmState === S.RUNNING) {
+    dispatch({ type: E.STOP });
+  } else if (fsmState === S.IDLE || fsmState === S.MIC_DENIED || fsmState === S.ERROR) {
+    callsign   = document.getElementById('callsign').value.trim().toUpperCase();
+    passphrase = document.getElementById('passphrase').value;
+    if (!callsign) { alert('Enter callsign'); return; }
+    localStorage.setItem('callsign', callsign);
+    dispatch({ type: E.START });
   }
 }
 
