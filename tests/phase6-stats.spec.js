@@ -45,15 +45,9 @@ test.describe('Phase 6 — OFDM Eb/N₀ + pilot phase stats', () => {
       window.ofdmProcessChunk(audio);
     });
 
-    // Both badges should become visible with numeric content
+    // Both graph containers should become visible
     await expect(page.locator('[data-testid="ofdm-snr"]')).toBeVisible({ timeout: 3000 });
     await expect(page.locator('[data-testid="ofdm-phase-err"]')).toBeVisible({ timeout: 3000 });
-
-    const snrText = await page.locator('[data-testid="ofdm-snr"]').textContent();
-    const phaseText = await page.locator('[data-testid="ofdm-phase-err"]').textContent();
-
-    expect(snrText).toMatch(/\d/);   // contains a digit
-    expect(phaseText).toMatch(/\d/); // contains a digit
 
     await page.click('[data-testid="toggle-btn"]');
     expect(page._errors).toHaveLength(0);
