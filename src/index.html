@@ -102,6 +102,23 @@
       </div>
     </div>
 
+    <!-- File transfer progress -->
+    <div id="xfer-progress" data-testid="xfer-progress" class="d-none mb-2">
+      <div class="d-flex align-items-center gap-2 mb-1">
+        <span id="xfer-filename" class="text-truncate fw-semibold small flex-grow-1"></span>
+        <span id="xfer-frag-count" class="text-muted small text-nowrap"></span>
+        <button class="btn btn-sm btn-outline-warning" data-testid="pause-resume-btn"
+          onclick="togglePauseTx()">⏸ Pause</button>
+        <button class="btn btn-sm btn-outline-danger" data-testid="cancel-xfer-btn"
+          onclick="cancelTx()">✕ Cancel</button>
+      </div>
+      <div class="progress" style="height:6px">
+        <div id="xfer-bar" data-testid="xfer-progress-bar"
+          class="progress-bar bg-primary progress-bar-striped progress-bar-animated"
+          style="width:0%"></div>
+      </div>
+    </div>
+
     <!-- Message input -->
     <div class="input-group">
       <input id="message" data-testid="message-input"

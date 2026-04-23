@@ -18,6 +18,13 @@ import { S, E, transition, isAudioActive } from './fsm.js';
 let fsmState   = S.IDLE;
 let fsmContext = { mode: 'bell202', errorMessage: null };
 
+// ── File transfer pause gate ───────────────────────────────────────────────
+// sendFile awaits _pauseGate between fragments; pause replaces it with a
+// pending Promise, resume/cancel resolve it.
+let _pauseGate    = Promise.resolve();
+let _pauseResolve = null;  // resolver for the current gate; null when not paused
+let _cancelXfer   = false; // set true by cancelTx() to break the send loop
+
 // ── Runtime state ─────────────────────────────────────────────────────────
 let audioContext, micNode, scriptNode;
 let _micStream = null; // held between requesting-mic → initializing
@@ -234,6 +241,10 @@ async function sendFile() {
   if (fsmState !== S.RUNNING) { alert('Click "Start Audio" first'); return; }
   fileInput.value = '';
 
+  _cancelXfer   = false;
+  _pauseGate    = Promise.resolve();
+  _pauseResolve = null;
+
   dispatch({ type: E.START_TX });
   try {
     await ensureCryptoKey();
@@ -246,24 +257,66 @@ async function sendFile() {
 
     const xferId = crypto.getRandomValues(new Uint8Array(2));
     const total  = Math.max(1, Math.ceil(compressed.length / CHUNK_SIZE));
+    updateXferProgress(file.name, 0, total);
 
     for (let seq = 0; seq < total; seq++) {
+      // Wait if paused (resolves immediately when running); bail if cancelled
+      await _pauseGate;
+      if (_cancelXfer) break;
+
       const data    = compressed.slice(seq * CHUNK_SIZE, (seq + 1) * CHUNK_SIZE);
       const payload = encodePacket({ xferId, seq, total, filename: seq === 0 ? file.name : undefined, data });
 
       const encrypted = await encryptBytesLocal(payload);
-      addChat(`TX FILE ${file.name} — fragment ${seq + 1}/${total} (${encrypted.length} B)`, 'file');
 
       if (fsmContext.mode === 'ofdm') {
         await playOfdmFrame(encrypted);
       } else {
         await playFrame(buildFrameRaw(encrypted, 'ALL', callsign));
       }
+
+      updateXferProgress(file.name, seq + 1, total);
     }
-    addChat(`TX FILE ${file.name} — all ${total} fragment(s) sent`, 'file');
+
+    if (_cancelXfer) {
+      addChat(`TX FILE ${file.name} — cancelled`, 'file');
+    } else {
+      addChat(`TX FILE ${file.name} — all ${total} fragment(s) sent`, 'file');
+    }
   } finally {
+    _cancelXfer   = false;
+    _pauseResolve = null;
+    _pauseGate    = Promise.resolve();
     dispatch({ type: E.TX_DONE });
   }
+}
+
+function updateXferProgress(filename, sent, total) {
+  document.getElementById('xfer-filename').textContent  = filename;
+  document.getElementById('xfer-frag-count').textContent = `${sent} / ${total}`;
+  document.getElementById('xfer-bar').style.width = `${total ? (sent / total) * 100 : 0}%`;
+}
+
+function togglePauseTx() {
+  if (fsmState === S.TX) {
+    // Pause: replace gate with a pending Promise
+    _pauseGate = new Promise(resolve => { _pauseResolve = resolve; });
+    dispatch({ type: E.PAUSE_TX });
+  } else if (fsmState === S.TX_PAUSED) {
+    // Resume: resolve the gate
+    if (_pauseResolve) { _pauseResolve(); _pauseResolve = null; }
+    _pauseGate = Promise.resolve();
+    dispatch({ type: E.RESUME_TX });
+  }
+}
+
+function cancelTx() {
+  _cancelXfer = true;
+  if (_pauseResolve) { _pauseResolve(); _pauseResolve = null; }
+  _pauseGate = Promise.resolve();
+  if (fsmState === S.TX_PAUSED) dispatch({ type: E.CANCEL_TX });
+  // If currently TX (playing a fragment), let TX_DONE fire normally;
+  // _cancelXfer will break the loop before the next fragment starts.
 }
 
 async function receiveFilePacket(rawData) {
@@ -345,11 +398,29 @@ function renderState(state, context) {
   for (const id of ['modemMode', 'callsign', 'passphrase', 'micSelect'])
     document.getElementById(id).disabled = active;
 
-  // Disable chat controls while transmitting
+  // Disable chat controls while actively transmitting (not while paused)
   const txing = state === S.TX;
   document.getElementById('message').disabled = txing;
   for (const tid of ['send-btn', 'send-file-btn'])
     document.querySelector(`[data-testid="${tid}"]`).disabled = txing;
+
+  // File transfer progress panel
+  const xferPanel   = document.getElementById('xfer-progress');
+  const pauseBtn    = document.querySelector('[data-testid="pause-resume-btn"]');
+  const xferBar     = document.getElementById('xfer-bar');
+  const inXfer      = state === S.TX || state === S.TX_PAUSED;
+  xferPanel.classList.toggle('d-none', !inXfer);
+  if (inXfer) {
+    if (state === S.TX_PAUSED) {
+      pauseBtn.textContent = '▶ Resume';
+      pauseBtn.className   = 'btn btn-sm btn-outline-success';
+      xferBar.classList.remove('progress-bar-animated');
+    } else {
+      pauseBtn.textContent = '⏸ Pause';
+      pauseBtn.className   = 'btn btn-sm btn-outline-warning';
+      xferBar.classList.add('progress-bar-animated');
+    }
+  }
 
   // Status badge
   const statusMap = {
@@ -574,6 +645,8 @@ window.gpuDft            = async (samples) => {
   return inst.dft(samples instanceof Float32Array ? samples : new Float32Array(samples));
 };
 window.sendFile        = sendFile;
+window.togglePauseTx  = togglePauseTx;
+window.cancelTx       = cancelTx;
 window.MARK_FREQ       = MARK_FREQ;
 window.SPACE_FREQ      = SPACE_FREQ;
 window.SAMPLE_RATE     = SAMPLE_RATE;

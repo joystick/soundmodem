@@ -79,12 +79,34 @@ describe('FSM — tx', () => {
     expect(t(S.TX, E.TX_DONE).state).toBe(S.RUNNING);
   });
 
+  it('PAUSE_TX → tx-paused', () => {
+    expect(t(S.TX, E.PAUSE_TX).state).toBe(S.TX_PAUSED);
+  });
+
   it('STOP → stopping (emergency stop during TX)', () => {
     expect(t(S.TX, E.STOP).state).toBe(S.STOPPING);
   });
 
   it('unknown event is a no-op', () => {
     expect(t(S.TX, E.START).state).toBe(S.TX);
+  });
+});
+
+describe('FSM — tx-paused', () => {
+  it('RESUME_TX → tx', () => {
+    expect(t(S.TX_PAUSED, E.RESUME_TX).state).toBe(S.TX);
+  });
+
+  it('CANCEL_TX → running', () => {
+    expect(t(S.TX_PAUSED, E.CANCEL_TX).state).toBe(S.RUNNING);
+  });
+
+  it('STOP → stopping', () => {
+    expect(t(S.TX_PAUSED, E.STOP).state).toBe(S.STOPPING);
+  });
+
+  it('unknown event is a no-op', () => {
+    expect(t(S.TX_PAUSED, E.START).state).toBe(S.TX_PAUSED);
   });
 });
 
@@ -122,7 +144,7 @@ describe('FSM — error', () => {
 
 describe('isAudioActive', () => {
   it('true for active states', () => {
-    for (const s of [S.REQUESTING_MIC, S.INITIALIZING, S.RUNNING, S.TX, S.STOPPING])
+    for (const s of [S.REQUESTING_MIC, S.INITIALIZING, S.RUNNING, S.TX, S.TX_PAUSED, S.STOPPING])
       expect(isAudioActive(s)).toBe(true);
   });
 
