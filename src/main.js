@@ -169,6 +169,8 @@ async function drainGpuQueue() {
 function processAudioChunk(inputSamples) {
   if (gpuDemodulator) {
     gpuQueue.push(new Float32Array(inputSamples)); // copy before SP buffer reuse
+    // Cap queue to prevent unbounded growth if GPU can't keep up
+    while (gpuQueue.length > 8) gpuQueue.shift();
     if (!gpuBusy) drainGpuQueue();
   } else {
     demodulator.cpuProcessChunk(inputSamples);
@@ -198,6 +200,9 @@ async function sendMsg() {
     src.buffer = buf; src.connect(audioContext.destination);
     await new Promise(resolve => { src.onended = resolve; src.start(); });
     addChat(`TX ${callsign}: ${msg}`, 'tx');
+  } catch (err) {
+    addChat(`TX error: ${err.message}`, 'err');
+    console.error('sendMsg error:', err);
   } finally {
     dispatch({ type: E.TX_DONE });
   }
@@ -283,6 +288,9 @@ async function sendFile() {
     } else {
       addChat(`TX FILE ${file.name} — all ${total} fragment(s) sent`, 'file');
     }
+  } catch (err) {
+    addChat(`TX FILE ${file.name} — error: ${err.message}`, 'err');
+    console.error('sendFile error:', err);
   } finally {
     _cancelXfer   = false;
     _pauseResolve = null;
@@ -499,9 +507,8 @@ async function initAudioHardware(context) {
   }
 }
 registerProcessor('ofdm-processor', OfdmProcessor);`;
-    const workletUrl = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
+    const workletUrl = `data:application/javascript,${encodeURIComponent(workletSrc)}`;
     await audioContext.audioWorklet.addModule(workletUrl);
-    URL.revokeObjectURL(workletUrl);
 
     function drawSparkline(canvas, history, { min, max, color, label }) {
       const ctx = canvas.getContext('2d');
