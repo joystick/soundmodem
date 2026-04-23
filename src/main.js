@@ -34,6 +34,7 @@ function addChat(text, cls) {
 function setModemMode(mode) {
   modemMode = mode;
   document.getElementById('modemMode').value = mode;
+  localStorage.setItem('modemMode', mode);
 }
 
 async function ensureCryptoKey() {
@@ -333,6 +334,16 @@ registerProcessor('ofdm-processor', OfdmProcessor);`;
           onMessage: receiveMsg,
           onFilePacket: receiveFilePacket,
           gpuDft: gpuDftInst,
+          onStats: ({ snrDb, phaseErrRad }) => {
+            if (!isRunning) return; // discard late GPU callbacks after stop
+            const snrEl   = document.getElementById('ofdm-snr');
+            const phaseEl = document.getElementById('ofdm-phase-err');
+            const snrClamped = Math.min(Math.max(snrDb, -9.9), 99.9);
+            snrEl.textContent   = `Eb/N₀ ${snrClamped.toFixed(1)} dB`;
+            phaseEl.textContent = `φ ${(phaseErrRad * 180 / Math.PI).toFixed(1)}°`;
+            snrEl.classList.remove('d-none');
+            phaseEl.classList.remove('d-none');
+          },
         });
         ofdmWorkletNode = new AudioWorkletNode(audioContext, 'ofdm-processor');
         ofdmWorkletNode.port.onmessage = e => {
@@ -367,6 +378,8 @@ registerProcessor('ofdm-processor', OfdmProcessor);`;
     gpuDpll.reset(); gpuDemodBits = []; gpuScanPos = 0;
     gpuQueue = []; cryptoKey = null;
     document.getElementById('demod-mode').textContent = '';
+    document.getElementById('ofdm-snr').classList.add('d-none');
+    document.getElementById('ofdm-phase-err').classList.add('d-none');
     setAudioState('stopped');
   }
 }
@@ -388,9 +401,15 @@ function getGpuDft() {
 // ── Init ───────────────────────────────────────────────────────────────────
 populateMicList();
 
-// Restore callsign from last session
-const _savedCallsign = localStorage.getItem('callsign');
-if (_savedCallsign) document.getElementById('callsign').value = _savedCallsign;
+// Restore persisted settings from last session
+{
+  const s = localStorage.getItem('callsign');
+  if (s) document.getElementById('callsign').value = s;
+  const p = localStorage.getItem('passphrase');
+  if (p) document.getElementById('passphrase').value = p;
+  const m = localStorage.getItem('modemMode');
+  if (m) setModemMode(m);
+}
 
 // ── Expose globals for Playwright tests ───────────────────────────────────
 window.buildFrame      = (msg, dst, src) => buildFrame(msg, dst, src || 'TEST01');
@@ -411,6 +430,7 @@ window.sendMsg           = sendMsg;
 window.setModemMode      = setModemMode;
 window.ofdmEncodeFrame   = ofdmEncodeFrame;
 window.createOfdmDemodulator = createOfdmDemodulator;
+window.ofdmProcessChunk      = (samples) => ofdmDemodInstance?.processChunk(samples);
 window.gpuDft            = async (samples) => {
   const inst = await getGpuDft();
   if (!inst) throw new Error('WebGPU not available');

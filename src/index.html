@@ -40,13 +40,15 @@
             <label class="form-label small text-secondary mb-1">Callsign</label>
             <input id="callsign" data-testid="callsign-input"
               class="form-control form-control-sm font-monospace text-uppercase"
-              placeholder="TEST01" maxlength="6" autocomplete="off">
+              placeholder="TEST01" maxlength="6" autocomplete="off"
+              oninput="localStorage.setItem('callsign', this.value)">
           </div>
           <div class="col-sm-4">
             <label class="form-label small text-secondary mb-1">Passphrase <span class="text-muted">(optional)</span></label>
             <input id="passphrase" data-testid="passphrase-input"
               class="form-control form-control-sm"
-              type="password" placeholder="shared secret">
+              type="password" placeholder="shared secret"
+              oninput="this.value ? localStorage.setItem('passphrase', this.value) : localStorage.removeItem('passphrase')">
           </div>
           <div class="col-sm-5">
             <label class="form-label small text-secondary mb-1">Microphone</label>
@@ -78,6 +80,10 @@
           class="badge rounded-pill bg-warning text-dark">Stopped</span>
         <span id="demod-mode" data-testid="demod-mode"
           class="badge rounded-pill bg-secondary text-light" style="font-size:0.7rem;"></span>
+        <span id="ofdm-snr" data-testid="ofdm-snr"
+          class="d-none badge rounded-pill bg-info text-dark" style="font-size:0.7rem;"></span>
+        <span id="ofdm-phase-err" data-testid="ofdm-phase-err"
+          class="d-none badge rounded-pill bg-secondary text-light" style="font-size:0.7rem;"></span>
       </span>
     </div>
 

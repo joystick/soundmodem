@@ -16,33 +16,49 @@ const SYM_LEN = OFDM_N + OFDM_CP; // 320 samples per symbol
 // After FFT, a carrier offset θ rotates every bin by θ·bin. We measure the
 // phase at each pilot bin and rotate all bins by the negative mean phase.
 // ---------------------------------------------------------------------------
+// applyPilotAfc(re, im) → { phaseErrRad, snrDb }
+// Rotates all bins to correct the mean pilot phase error.
+// Returns the measured phase error (before correction) and pilot SNR.
 function applyPilotAfc(re, im) {
-  // Measure phase at each pilot bin
+  // Measure phase at each pilot bin (pilots transmitted as +1 real)
   let phaseSum = 0;
   for (const b of OFDM_PILOT_BINS) {
     phaseSum += Math.atan2(im[b], re[b]);
   }
-  const correction = -phaseSum / OFDM_PILOT_BINS.length;
+  const phaseErrRad = phaseSum / OFDM_PILOT_BINS.length;
+  const correction  = -phaseErrRad;
   const cosC = Math.cos(correction);
   const sinC = Math.sin(correction);
 
-  // Rotate all bins (only the active ones matter for decoding)
+  // Rotate all bins
   for (let i = 0; i < OFDM_N; i++) {
-    const r = re[i] * cosC - im[i] * sinC;
+    const r    = re[i] * cosC - im[i] * sinC;
     const newIm = re[i] * sinC + im[i] * cosC;
     re[i] = r;
     im[i] = newIm;
   }
+
+  // After rotation pilots should be near (1, 0).
+  // SNR = signal power / noise power, estimated from pilot bins.
+  let sigPow = 0, noisePow = 0;
+  for (const b of OFDM_PILOT_BINS) {
+    sigPow   += re[b] * re[b];
+    noisePow += im[b] * im[b];
+  }
+  const snrDb = 10 * Math.log10(sigPow / Math.max(noisePow, 1e-20));
+
+  return { phaseErrRad, snrDb };
 }
 
 // ---------------------------------------------------------------------------
 // ofdmDemodulateWithAfc(samples) → boolean[]
 // Like ofdmDemodulateRaw but applies per-symbol pilot-phase correction.
 // ---------------------------------------------------------------------------
-function ofdmDemodulateWithAfc(samples) {
+function ofdmDemodulateWithAfc(samples, onStats) {
   const dataCarriers = OFDM_DATA_CARRIERS;
   const numSymbols = samples.length / SYM_LEN;
   const bits = [];
+  let lastStats = null;
 
   // Inline FFT (same radix-2 as in ofdm.js — duplicated here to avoid exporting internals)
   function fft(re, im) {
@@ -83,13 +99,14 @@ function ofdmDemodulateWithAfc(samples) {
     for (let i = 0; i < OFDM_N; i++) { re[i] = samples[base + i]; im[i] = 0; }
 
     fft(re, im);
-    applyPilotAfc(re, im);
+    lastStats = applyPilotAfc(re, im);
 
     for (const bin of dataCarriers) {
       bits.push(re[bin] >= 0);
     }
   }
 
+  if (lastStats && onStats) onStats(lastStats);
   return bits;
 }
 
@@ -128,25 +145,25 @@ function decodeFrame(rawBits) {
 // GPU DFT demodulation path
 // Uses the GPU for the per-symbol DFT; pilot AFC and Viterbi run on CPU.
 // ---------------------------------------------------------------------------
-async function ofdmDemodulateWithGpu(samples, gpuDftFn) {
+async function ofdmDemodulateWithGpu(samples, gpuDftFn, onStats) {
   const dataCarriers = OFDM_DATA_CARRIERS;
   const numSymbols = Math.floor(samples.length / SYM_LEN);
   const bits = [];
+  let lastStats = null;
 
   for (let s = 0; s < numSymbols; s++) {
     const base = s * SYM_LEN + OFDM_CP;
     const window = samples.slice(base, base + OFDM_N);
-    // GPU DFT returns Float32Arrays; convert to Float64-compatible objects for AFC
     const { re: reF32, im: imF32 } = await gpuDftFn(new Float32Array(window));
-    // Copy to mutable arrays for pilot AFC rotation
     const re = new Float64Array(reF32);
     const im = new Float64Array(imF32);
-    applyPilotAfc(re, im);
+    lastStats = applyPilotAfc(re, im);
     for (const bin of dataCarriers) {
       bits.push(re[bin] >= 0);
     }
   }
 
+  if (lastStats && onStats) onStats(lastStats);
   return bits;
 }
 
@@ -160,7 +177,7 @@ async function ofdmDemodulateWithGpu(samples, gpuDftFn) {
 // processChunk accepts a Float32Array of audio samples (any length).
 // A frame is decoded when a complete set of symbols has been received.
 // ---------------------------------------------------------------------------
-export function createOfdmDemodulator({ onMessage, onFilePacket, gpuDft = null, preferGpu = false }) {
+export function createOfdmDemodulator({ onMessage, onFilePacket, onStats = null, gpuDft = null, preferGpu = false }) {
   let sampleBuffer = new Float32Array(0);
   let resolvedGpu = gpuDft;       // GpuDft instance or null
   let gpuReady    = !!gpuDft;     // true once we know GPU state
@@ -192,14 +209,14 @@ export function createOfdmDemodulator({ onMessage, onFilePacket, gpuDft = null, 
       sampleBuffer     = sampleBuffer.slice(frameLen);
 
       if (resolvedGpu) {
-        ofdmDemodulateWithGpu(frame, s => resolvedGpu.dft(s))
+        ofdmDemodulateWithGpu(frame, s => resolvedGpu.dft(s), onStats)
           .then(rawBits => {
             const text = decodeFrame(rawBits);
             if (text !== null) onMessage(text);
           })
           .catch(() => {});
       } else {
-        const rawBits = ofdmDemodulateWithAfc(frame);
+        const rawBits = ofdmDemodulateWithAfc(frame, onStats);
         const text    = decodeFrame(rawBits);
         if (text !== null) onMessage(text);
       }
