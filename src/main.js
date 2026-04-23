@@ -340,10 +340,17 @@ registerProcessor('ofdm-processor', OfdmProcessor);`;
           onStats: ({ snrDb, phaseErrRad }) => {
             if (!isRunning) return; // discard late GPU callbacks after stop
             // Seed on first sample; apply EMA thereafter
-            smoothSnr   = smoothSnr   === null ? snrDb      : smoothSnr   + STATS_ALPHA * (snrDb      - smoothSnr);
+            smoothSnr   = smoothSnr   === null ? snrDb       : smoothSnr   + STATS_ALPHA * (snrDb       - smoothSnr);
             smoothPhase = smoothPhase === null ? phaseErrRad : smoothPhase + STATS_ALPHA * (phaseErrRad - smoothPhase);
             const snrEl   = document.getElementById('ofdm-snr');
             const phaseEl = document.getElementById('ofdm-phase-err');
+            // Only show stats when SNR is high enough to indicate real signal (>3 dB).
+            // Below that, noise dominates and the values are meaningless.
+            if (smoothSnr < 3) {
+              snrEl.classList.add('d-none');
+              phaseEl.classList.add('d-none');
+              return;
+            }
             const snrClamped = Math.min(Math.max(smoothSnr, -9.9), 99.9);
             snrEl.textContent   = `Eb/N₀ ${snrClamped.toFixed(1)} dB`;
             phaseEl.textContent = `φ ${(smoothPhase * 180 / Math.PI).toFixed(1)}°`;
