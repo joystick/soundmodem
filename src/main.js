@@ -330,17 +330,23 @@ registerProcessor('ofdm-processor', OfdmProcessor);`;
         const workletUrl = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
         await audioContext.audioWorklet.addModule(workletUrl);
         URL.revokeObjectURL(workletUrl);
+        // EMA state for smoothing per-symbol stats before display (α=0.15 ≈ 6-sample TC)
+        const STATS_ALPHA = 0.15;
+        let smoothSnr = null, smoothPhase = null;
         ofdmDemodInstance = createOfdmDemodulator({
           onMessage: receiveMsg,
           onFilePacket: receiveFilePacket,
           gpuDft: gpuDftInst,
           onStats: ({ snrDb, phaseErrRad }) => {
             if (!isRunning) return; // discard late GPU callbacks after stop
+            // Seed on first sample; apply EMA thereafter
+            smoothSnr   = smoothSnr   === null ? snrDb      : smoothSnr   + STATS_ALPHA * (snrDb      - smoothSnr);
+            smoothPhase = smoothPhase === null ? phaseErrRad : smoothPhase + STATS_ALPHA * (phaseErrRad - smoothPhase);
             const snrEl   = document.getElementById('ofdm-snr');
             const phaseEl = document.getElementById('ofdm-phase-err');
-            const snrClamped = Math.min(Math.max(snrDb, -9.9), 99.9);
+            const snrClamped = Math.min(Math.max(smoothSnr, -9.9), 99.9);
             snrEl.textContent   = `Eb/N₀ ${snrClamped.toFixed(1)} dB`;
-            phaseEl.textContent = `φ ${(phaseErrRad * 180 / Math.PI).toFixed(1)}°`;
+            phaseEl.textContent = `φ ${(smoothPhase * 180 / Math.PI).toFixed(1)}°`;
             snrEl.classList.remove('d-none');
             phaseEl.classList.remove('d-none');
           },
