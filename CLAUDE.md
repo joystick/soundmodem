@@ -1,31 +1,95 @@
 # SoundModem P2P Chat
 
-Single-file browser app (`index.html`) implementing P2P text chat over audio using AX.25 UI frames modulated as Bell 202 AFSK. No build step, no dependencies, no server.
+Single-file browser app implementing P2P text chat and file transfer over audio using AX.25 UI frames modulated as Bell 202 AFSK. Source lives in `src/` ES modules; `npm run build` produces a self-contained `dist/index.html`.
 
 ## How to run
 
 ```bash
+# Development (source modules, watch mode)
+npm run dev
 python3 -m http.server 8765
 # open http://localhost:8765/index.html
+
+# Production build (single-file, shareable)
+npm run build
+python3 -m http.server 8765
+# open http://localhost:8765/dist/index.html
 ```
 
 `file://` is blocked by browsers — `getUserMedia` and WebGPU both require a secure context (localhost qualifies).
+
+## Testing
+
+```bash
+npm test           # run all unit tests (54 tests, Vitest)
+npm run test:watch # watch mode
+```
+
+Playwright integration tests use the live dev server at `http://localhost:8765`. The built `dist/index.html` exposes all pure functions on `window` for Playwright access.
+
+## Build system
+
+| Tool | Purpose |
+|---|---|
+| **Rollup 4** | Bundles `src/main.js` → `dist/bundle.js` (IIFE) |
+| `scripts/build.js` | Inlines bundle into `src/index.html` → `dist/index.html` |
+| **Vitest 3** | Unit test runner, Node environment, ESM-native |
+| `.nvmrc` | Pins Node 22.21.1 (required for WebCrypto + CompressionStream in tests) |
+
+```
+npm run build      → dist/index.html  (38 KB, self-contained)
+npm run dev        → rollup --watch
+npm test           → vitest run
+npm run test:watch → vitest
+```
+
+## Module structure
+
+```
+src/
+  crc16.js        crc16(bytes) — CRC-16-CCITT
+  ax25.js         encodeCallsign, bitStuff, buildFrame(msg,dst,src), buildFrameRaw(bytes,dst,src)
+  dpll.js         DPLL class — clock recovery
+  modulate.js     modulate(frameBytes) → Float32Array; exports AFSK constants
+  goertzel.js     goertzel(samples, freq) — sliding Goertzel magnitude
+  demodulate.js   createDemodulator({onMessage, onFilePacket}) — factory, encapsulates state
+  compress.js     compress(data) / decompress(data) — DeflateRaw streams
+  crypto.js       deriveKey(passphrase) / encryptBytes(key, plain) / decryptBytes(key, cipher)
+  packet.js       encodePacket({xferId,seq,total,filename?,data}) / decodePacket(bytes)
+  gpu.js          GpuDemodulator, initWebGpu() — WebGPU compute shaders
+  audio.js        toggleAudio, sendMsg, sendFile, receiveFilePacket, playFrame
+  ui.js           addChat, populateMicList — DOM helpers
+  main.js         entry point; wires modules, manages runtime state, exposes window.* globals
+
+test/
+  crc16.test.js · ax25.test.js · dpll.test.js · modulate.test.js · goertzel (in ax25)
+  demodulate.test.js · packet.test.js · compress.test.js · crypto.test.js · loopback.test.js
+
+src/index.html    HTML template (<!-- BUNDLE --> placeholder)
+dist/index.html   built output — hand this to testers
+```
+
+Key architectural decision: `buildFrame`/`buildFrameRaw` take an explicit `src` callsign parameter (not module state). `createDemodulator` encapsulates `demodBits`, `scanPos`, `sampleBuffer`, and `DPLL` state in a closure; state is not globally accessible.
+
+---
 
 ## Tech stack
 
 | Layer | Technology |
 |---|---|
-| Language | Vanilla JavaScript (ES2020), no frameworks |
+| Language | Vanilla JavaScript (ES2020 modules), no frameworks |
+| Build | Rollup 4 — IIFE bundle inlined into HTML |
+| Tests | Vitest 3 (unit) + Playwright MCP (integration) |
 | Audio I/O | Web Audio API — `AudioContext`, `MediaStreamSource`, `ScriptProcessor`, `BufferSource` |
 | Mic access | `navigator.mediaDevices.getUserMedia` |
 | Encryption | Web Crypto API — PBKDF2 → AES-GCM-256 |
+| Compression | `CompressionStream` / `DecompressionStream` (DeflateRaw) |
 | Framing | AX.25 UI frames |
 | Modulation | Bell 202 AFSK, 1200 baud |
 | RX demod (primary) | WebGPU compute — FM discriminator (WGSL) |
 | RX demod (fallback 1) | WebGPU compute — parallel Goertzel (WGSL) |
 | RX demod (fallback 2) | CPU Goertzel (JavaScript) |
 | Clock recovery | DPLL (Digital Phase-Locked Loop) |
-| Testing | Playwright MCP + `python3 -m http.server` |
 
 ---
 
@@ -42,6 +106,19 @@ flowchart LR
     E --> F[AudioBufferSource\n→ destination]
 ```
 
+### TX (file)
+
+```mermaid
+flowchart LR
+    F[File] --> COMP[compress\nDeflateRaw]
+    COMP --> FRAG[fragment\n3500 B chunks]
+    FRAG --> PKT[encodePacket\nmagic+xferId+seq+total+fname+data]
+    PKT --> ENC[encryptBytes\nAES-GCM binary]
+    ENC --> BFR[buildFrameRaw\nAX.25 UI]
+    BFR --> PLAY[playFrame\nawait onended]
+    PLAY --> FRAG
+```
+
 ### RX
 
 ```mermaid
@@ -56,7 +133,8 @@ flowchart LR
     CPU --> DPLL
     DPLL --> BITS[demodBits]
     BITS --> DEC[tryDecodeFrame\nflag scan + destuff + CRC]
-    DEC --> RX[receiveMsg\ndecrypt + display]
+    DEC -->|text| RX[receiveMsg\ndecrypt + display]
+    DEC -->|FILE_MAGIC| FRX[receiveFilePacket\ndecrypt + reassemble + decompress]
 ```
 
 ---
@@ -155,6 +233,12 @@ flowchart TD
 | `snapshot` | `true` | Frequency captured at symbol start for bit decision |
 | `lastFreq` | `true` | Previous high-rate sample (for transition detection) |
 | `lastSymFreq` | `true` | Frequency at previous symbol (for NRZI decode) |
+
+### `tryDecodeFrame` performance
+
+The outer flag-scan loop uses a persistent `scanPos` offset so each bit is only scanned once across successive `tryDecodeFrame` calls. Without this, a 36 000-bit buffer × O(n) inner scans per spurious flag match ≈ millions of iterations every 93 ms, blocking the main thread and starving the audio callback.
+
+The buffer tail is capped at 36 000 bits — enough for one max-size file packet (3500 B chunk + overhead ≈ 34 000 bits) without unbounded growth.
 
 ---
 
@@ -256,6 +340,26 @@ sequenceDiagram
 
 ---
 
+## File transfer packet format
+
+```
+Bytes 0–1:   0xFE 0xFF              magic (FILE_MAGIC)
+Bytes 2–3:   xferId                 random 2-byte transfer ID (same for all fragments)
+Bytes 4–5:   seq                    big-endian uint16, 0-based fragment index
+Bytes 6–7:   total                  big-endian uint16, total fragment count
+seq=0 only:  [fnameLen 2B][fname UTF-8]
+Then:        compressed file data chunk (up to CHUNK_SIZE=3500 B)
+```
+
+Entire payload is AES-GCM encrypted before being placed in the AX.25 data field. On receive, `FILE_MAGIC` is detected in `tryDecodeFrame` before the frame is dispatched to `receiveFilePacket`.
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `FILE_MAGIC` | `[0xFE, 0xFF]` | Distinguishes file packets from text messages |
+| `CHUNK_SIZE` | 3500 B | Compressed data per fragment |
+
+---
+
 ## AX.25 frame format
 
 ```
@@ -279,6 +383,7 @@ packet-beta
 - **FCS:** CRC-16-CCITT (poly `0x1021`, init `0xFFFF`) over `DST + SRC + CTRL + PID + DATA` — excludes the `0x7E` flags and the FCS itself
 - **Bit stuffing:** insert `0` after every 5 consecutive `1`s in the frame content, **before** NRZI; the `0x7E` flag bytes are exempt
 - **NRZI:** `0` bit → toggle frequency; `1` bit → keep current frequency
+- **Frame size cap:** inner flag-scan loop capped at 32 768 bits to support file transfer packets (~4 KB data)
 
 ### Modulation pipeline
 
@@ -298,7 +403,8 @@ flowchart LR
 Optional symmetric encryption. Both peers must use the same passphrase.
 
 - Key derivation: PBKDF2 (SHA-256, 100 000 iterations, 16-byte zero salt) → AES-GCM-256
-- Wire format: `base64(12-byte-IV ‖ AES-GCM-ciphertext)` in the AX.25 data field
+- Text wire format: `base64(12-byte-IV ‖ AES-GCM-ciphertext)` in the AX.25 data field
+- Binary (file) wire format: raw `12-byte-IV ‖ AES-GCM-ciphertext` bytes (no base64)
 - `cryptoKey` is derived once and cached; stopping and restarting audio clears it
 
 ---
@@ -338,9 +444,30 @@ On page load `populateMicList()` does a temporary `getUserMedia` grant to read d
 | `chat-log` | Chat message container |
 | `message-input` | Outgoing message text field |
 | `send-btn` | Send button |
+| `send-file-btn` | Send File button |
 | `chat-entry-tx` | TX message div (green) |
 | `chat-entry-rx` | RX message div (blue) |
 | `chat-entry-err` | Error message div (red) |
+| `chat-entry-file` | File transfer status div |
+
+---
+
+## Window globals exposed for testing
+
+`dist/index.html` exposes these on `window` for Playwright integration tests:
+
+| Global | Source |
+|---|---|
+| `buildFrame(msg, dst, src)` | `src/ax25.js` |
+| `buildFrameRaw(bytes, dst, src)` | `src/ax25.js` |
+| `modulate(frameBytes)` | `src/modulate.js` |
+| `cpuProcessChunk(samples)` | `demodulator` instance in `main.js` |
+| `resetDemodulator()` | `demodulator.reset()` |
+| `compress(data)` / `decompress(data)` | `src/compress.js` |
+| `createDemodulator({onMessage, onFilePacket})` | `src/demodulate.js` |
+| `DPLL` | `src/dpll.js` |
+| `crc16`, `bitStuff`, `encodeCallsign`, `goertzel` | pure modules |
+| `MARK_FREQ`, `SPACE_FREQ`, `SAMPLE_RATE`, `SPB`, `STEP`, `PREAMBLE_FLAGS`, `POSTAMBLE_FLAGS` | `src/modulate.js` |
 
 ---
 
@@ -353,3 +480,4 @@ On page load `populateMicList()` does a temporary `getUserMedia` grant to read d
 - First high-rate position per GPU chunk is skipped by the discriminator (needs prior-sample differential)
 - WebGPU `mapAsync` adds ~1–5 ms latency per chunk; imperceptible at 1200 baud
 - DPLL uses phase-first-increment, making the effective sample point `phase < 1` (symbol start); midpoint sampling would give better noise margin on weak signals
+- File transfer: no ARQ (retransmit on loss) or FEC — planned for maritime use case
