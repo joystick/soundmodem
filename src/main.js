@@ -410,13 +410,18 @@ async function receiveFilePacket(rawData) {
   }
   const xfer = incomingTransfers.get(xferId);
   if (filename) xfer.filename = filename;
-  xfer.fragments[seq] = data;
+
+  const isDuplicate = !!xfer.fragments[seq];
+  if (!isDuplicate) xfer.fragments[seq] = data;
 
   const received = xfer.fragments.filter(Boolean).length;
-  addChat(`RX FILE ${xfer.filename || '?'} — fragment ${seq + 1}/${total} (${received}/${total})`, 'file');
 
-  // Send ACK back to sender — grab raw xferId bytes from the decrypted packet
+  // Always re-ACK (original ACK may have been lost, triggering retransmit)
   sendAck(decrypted.slice(2, 4), seq);
+
+  if (isDuplicate) return; // don't log or re-trigger reassembly
+
+  addChat(`RX FILE ${xfer.filename || '?'} — fragment ${seq + 1}/${total} (${received}/${total})`, 'file');
 
   if (received === total && xfer.fragments.every(Boolean)) {
     const combined = new Uint8Array(xfer.fragments.reduce((n, f) => n + f.length, 0));
