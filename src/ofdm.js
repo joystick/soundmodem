@@ -108,8 +108,9 @@ export function ofdmModulate(bits) {
     // IFFT → time domain
     ifft(re, im);
 
-    // Normalise (peak ≈ 1.0 for unit BPSK symbols)
-    const norm = 1.0 / Math.sqrt(dataCarriers.length + PILOT_BINS.size);
+    // The IFFT divides by N=256, so raw RMS ≈ sqrt(K)/N ≈ 0.029 (K=56 active bins).
+    // Multiply by N/(4·sqrt(K)) to target RMS ≈ 0.25, safe against OFDM PAPR peaks.
+    const norm = OFDM_N / (4 * Math.sqrt(dataCarriers.length + PILOT_BINS.size));
 
     // Write cyclic prefix then symbol
     const base = s * symLen;
