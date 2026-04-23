@@ -499,9 +499,8 @@ async function initAudioHardware(context) {
   }
 }
 registerProcessor('ofdm-processor', OfdmProcessor);`;
-    const workletUrl = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
+    const workletUrl = `data:application/javascript,${encodeURIComponent(workletSrc)}`;
     await audioContext.audioWorklet.addModule(workletUrl);
-    URL.revokeObjectURL(workletUrl);
 
     function drawSparkline(canvas, history, { min, max, color, label }) {
       const ctx = canvas.getContext('2d');
