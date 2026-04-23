@@ -155,3 +155,40 @@ export function ofdmDemodulateRaw(samples) {
 
   return bits;
 }
+
+// ---------------------------------------------------------------------------
+// ofdmEncodeFrame(text) → Float32Array
+// Encodes a UTF-8 string as an OFDM frame:
+//   [16-bit byte count (MSB first)] [UTF-8 bytes (LSB-first bits)]
+// → convEncode → interleave(INTERLEAVE_DEPTH) → ofdmModulate
+// Import INTERLEAVE_DEPTH from ofdm-demodulate.js to keep encoding symmetric.
+// ---------------------------------------------------------------------------
+import { convEncode, interleave } from './fec.js';
+
+export const OFDM_INTERLEAVE_DEPTH = OFDM_DATA_CARRIERS.length; // 52
+
+export function ofdmEncodeFrame(text) {
+  const textBytes = new TextEncoder().encode(text);
+  const byteCount = textBytes.length;
+
+  // 16-bit length header (MSB first) + payload bytes → bit array
+  const bits = [];
+
+  // Length: 16 bits, MSB first
+  for (let i = 15; i >= 0; i--) {
+    bits.push(((byteCount >> i) & 1) !== 0);
+  }
+
+  // Payload bytes: LSB first per byte
+  for (const byte of textBytes) {
+    for (let bit = 0; bit < 8; bit++) {
+      bits.push(((byte >> bit) & 1) !== 0);
+    }
+  }
+
+  // FEC: encode then interleave
+  const encoded = convEncode(bits);
+  const interleaved = interleave(encoded, OFDM_INTERLEAVE_DEPTH);
+
+  return ofdmModulate(interleaved);
+}
