@@ -1,6 +1,7 @@
 // ── File packet encode/decode ──────────────────────────────────────────────
 
 export const FILE_MAGIC = [0xFE, 0xFF];
+export const ACK_MAGIC  = [0xFE, 0xFD];
 export const CHUNK_SIZE = 3500;
 
 /**
@@ -58,4 +59,35 @@ export function decodePacket(payload) {
 
   const data = payload.slice(dataOffset);
   return { xferId, seq, total, filename, data };
+}
+
+// ── ACK packet encode/decode ────────────────────────────────────────────────
+
+/**
+ * Encode an ACK packet: ACK_MAGIC (2B) + xferId (2B) + seq (2B big-endian).
+ * @param {object} opts
+ * @param {Uint8Array} opts.xferId - 2-byte transfer ID being acknowledged
+ * @param {number}     opts.seq    - fragment sequence number being acknowledged
+ * @returns {Uint8Array} 6-byte ACK packet
+ */
+export function encodeAck({ xferId, seq }) {
+  const buf = new Uint8Array(6);
+  buf[0] = 0xFE; buf[1] = 0xFD;
+  buf[2] = xferId[0]; buf[3] = xferId[1];
+  buf[4] = (seq >> 8) & 0xFF; buf[5] = seq & 0xFF;
+  return buf;
+}
+
+/**
+ * Decode an ACK packet.
+ * @param {Uint8Array} payload
+ * @returns {{ xferId: string, seq: number }|null}
+ */
+export function decodeAck(payload) {
+  if (!payload || payload.length < 6) return null;
+  if (payload[0] !== 0xFE || payload[1] !== 0xFD) return null;
+  const xferId = payload[2].toString(16).padStart(2, '0') +
+                 payload[3].toString(16).padStart(2, '0');
+  const seq = (payload[4] << 8) | payload[5];
+  return { xferId, seq };
 }

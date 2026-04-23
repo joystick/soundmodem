@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { encodePacket, decodePacket, FILE_MAGIC, CHUNK_SIZE } from '../src/packet.js';
+import { encodePacket, decodePacket, FILE_MAGIC, CHUNK_SIZE, ACK_MAGIC, encodeAck, decodeAck } from '../src/packet.js';
 
 describe('encodePacket / decodePacket', () => {
   it('FILE_MAGIC is [0xFE, 0xFF]', () => {
@@ -63,5 +63,50 @@ describe('encodePacket / decodePacket', () => {
     const payload = encodePacket({ xferId, seq: 0, total: 1, data });
     expect(payload[0]).toBe(0xFE);
     expect(payload[1]).toBe(0xFF);
+  });
+});
+
+describe('ACK packet encode/decode', () => {
+  it('ACK_MAGIC is [0xFE, 0xFD]', () => {
+    expect(ACK_MAGIC).toEqual([0xFE, 0xFD]);
+  });
+
+  it('encodeAck produces a 6-byte Uint8Array', () => {
+    const ack = encodeAck({ xferId: new Uint8Array([0x12, 0x34]), seq: 0 });
+    expect(ack).toBeInstanceOf(Uint8Array);
+    expect(ack.length).toBe(6);
+  });
+
+  it('ACK_MAGIC bytes are at offset 0–1', () => {
+    const ack = encodeAck({ xferId: new Uint8Array([0x00, 0x00]), seq: 0 });
+    expect(ack[0]).toBe(0xFE);
+    expect(ack[1]).toBe(0xFD);
+  });
+
+  it('round-trips xferId and seq', () => {
+    const ack = encodeAck({ xferId: new Uint8Array([0xAB, 0xCD]), seq: 42 });
+    const dec = decodeAck(ack);
+    expect(dec).not.toBeNull();
+    expect(dec.xferId).toBe('abcd');
+    expect(dec.seq).toBe(42);
+  });
+
+  it('decodes high seq numbers (big-endian)', () => {
+    const ack = encodeAck({ xferId: new Uint8Array([0x01, 0x02]), seq: 300 });
+    const dec = decodeAck(ack);
+    expect(dec.seq).toBe(300);
+  });
+
+  it('returns null for wrong magic', () => {
+    const bad = new Uint8Array([0xFE, 0xFF, 0x00, 0x00, 0x00, 0x00]);
+    expect(decodeAck(bad)).toBeNull();
+  });
+
+  it('returns null for too-short input', () => {
+    expect(decodeAck(new Uint8Array([0xFE, 0xFD, 0x00]))).toBeNull();
+  });
+
+  it('returns null for null input', () => {
+    expect(decodeAck(null)).toBeNull();
   });
 });
