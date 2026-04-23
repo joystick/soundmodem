@@ -65,6 +65,13 @@
         onclick="toggleAudio()">
         ▶ Start Audio
       </button>
+      <select id="modemMode" data-testid="modem-mode-select"
+        class="form-select form-select-sm"
+        style="width:auto"
+        onchange="setModemMode(this.value)">
+        <option value="bell202">Bell 202</option>
+        <option value="ofdm">OFDM-HF</option>
+      </select>
       <span class="d-flex align-items-center gap-2 ms-1">
         <span id="status" data-testid="status"
           class="badge rounded-pill bg-warning text-dark">Stopped</span>

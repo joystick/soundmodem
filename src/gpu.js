@@ -156,6 +156,11 @@ export class GpuDemodulator {
   }
 }
 
+// Shared GPU device — exposed so other modules can reuse the same device
+// instead of calling requestDevice() a second time.
+let _gpuDevice = null;
+export function getSharedGpuDevice() { return _gpuDevice; }
+
 export async function initWebGpu(addChat) {
   const el = document.getElementById('demod-mode');
   if (!navigator.gpu) { el.textContent = 'using CPU'; el.style.color = '#b8860b'; return null; }
@@ -163,6 +168,7 @@ export async function initWebGpu(addChat) {
     const adapter = await navigator.gpu.requestAdapter();
     if (!adapter) throw new Error('no adapter');
     const device  = await adapter.requestDevice();
+    _gpuDevice = device;
     device.lost.then(info => {
       const dm = document.getElementById('demod-mode');
       dm.textContent = 'using CPU'; dm.style.color = '#b8860b';

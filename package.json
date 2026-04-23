@@ -6,11 +6,13 @@
     "build": "node scripts/build.js",
     "dev": "rollup -c -w",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:e2e": "playwright test"
   },
   "devDependencies": {
-    "rollup": "^4.0.0",
+    "@playwright/test": "^1.59.1",
     "@rollup/plugin-node-resolve": "^15.0.0",
+    "rollup": "^4.0.0",
     "vitest": "^3.0.0"
   }
 }
