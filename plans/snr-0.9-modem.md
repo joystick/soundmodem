@@ -5,12 +5,13 @@
 ## Architectural decisions
 
 - **Modem modes**: OFDM-HF lives alongside Bell 202 — not a replacement. UI toggle switches active mode.
-- **OFDM parameters**: N=64 IFFT/FFT, Δf=150 Hz, 64 subcarriers (~9.6 kHz span), CP=16 samples → symbol period ≈ 1.81 ms @ 44100 Hz.
-- **FEC**: Rate 1/2, K=7 convolutional code (polynomials 171₈/133₈) + block interleaver. Viterbi decode. Hard-decision first, soft-decision deferred.
+- **OFDM parameters**: N=256 IFFT/FFT, CP=64 samples, 52 data subcarriers (bins 6–31 + 33–58), 4 pilot bins (bins 5, 32, 59, 10). Symbol period = 320 samples @ 44100 Hz ≈ 7.26 ms.
+- **FEC**: Rate 1/2, K=7 convolutional code (polynomials 171₈/133₈) + block interleaver. Viterbi decode. Hard-decision.
 - **Framing**: AX.25 UI frames + CRC-16 retained as outer integrity layer.
-- **Audio I/O**: AudioWorklet replaces ScriptProcessor for OFDM mode.
-- **GPU parallelism**: Viterbi GPU acceleration uses SIMD-over-frames (multiple simultaneous frames), not within-frame. Falls back to CPU when WebGPU unavailable.
-- **Callbacks**: OFDM demodulator exposes the same `{ onMessage, onFilePacket }` interface as the existing `createDemodulator`.
+- **Audio I/O**: AudioWorklet replaces ScriptProcessor for OFDM mode. Worklet inlined as Blob URL for single-file deployment (no separate module URL needed).
+- **GPU DFT**: WGSL direct-DFT compute shader (256-thread workgroup) via `src/ofdm-gpu.js`. Shares the same `GPUDevice` obtained by `gpu.js` to avoid concurrent `requestAdapter()` race. Viterbi GPU acceleration deferred — CPU Viterbi retained.
+- **Callbacks**: OFDM demodulator exposes `{ onMessage, onFilePacket, onStats }` — `onStats` is optional and delivers `{ snrDb, phaseErrRad }` after each frame.
+- **Persistence**: callsign, passphrase, and modem mode saved to `localStorage` on every change; restored on page load.
 
 ---
 
@@ -24,10 +25,10 @@ A standalone `ofdmModulate(bits)` function that maps bits to BPSK symbols on 64 
 
 ### Acceptance criteria
 
-- [ ] `ofdmModulate` produces a `Float32Array` whose length equals `(N + CP) * numSymbols` samples
-- [ ] `ofdmDemodulateRaw(ofdmModulate(bits))` returns the original bits with zero errors (noiseless loopback)
-- [ ] Pilot tone positions are fixed and documented in the module
-- [ ] Unit test runs under `npm test` with no browser/audio dependencies
+- [x] `ofdmModulate` produces a `Float32Array` whose length equals `(N + CP) * numSymbols` samples
+- [x] `ofdmDemodulateRaw(ofdmModulate(bits))` returns the original bits with zero errors (noiseless loopback)
+- [x] Pilot tone positions are fixed and documented in the module
+- [x] Unit test runs under `npm test` with no browser/audio dependencies
 
 ---
 
@@ -41,10 +42,10 @@ A `convEncode(bits)` function and a `viterbiDecode(softBits)` function (hard-dec
 
 ### Acceptance criteria
 
-- [ ] `viterbiDecode(convEncode(bits))` recovers original bits with zero errors (noiseless)
-- [ ] BER test: >80% of 100 random 256-bit payloads survive at simulated Eb/N₀ = -0.5 dB
-- [ ] Interleaver depth is a parameter; default chosen to span at least 2× expected fade duration
-- [ ] All functions are pure and unit-tested with no audio/browser dependencies
+- [x] `viterbiDecode(convEncode(bits))` recovers original bits with zero errors (noiseless)
+- [x] BER test: >80% of 100 random 256-bit payloads survive at simulated Eb/N₀ = -0.5 dB
+- [x] Interleaver depth is a parameter; default chosen to span at least 2× expected fade duration
+- [x] All functions are pure and unit-tested with no audio/browser dependencies
 
 ---
 
@@ -58,10 +59,10 @@ Wire Phase 1 + Phase 2 into a full RX pipeline: FFT → pilot-phase AFC correcti
 
 ### Acceptance criteria
 
-- [ ] `createOfdmDemodulator` accepts the same `{ onMessage, onFilePacket }` callback shape as `createDemodulator`
-- [ ] End-to-end Vitest loopback: modulate a text message → demodulate → `onMessage` fires with the correct string
-- [ ] Pilot-tone AFC corrects a synthetic ±5 Hz carrier offset without decode failure
-- [ ] Passes under `npm test`
+- [x] `createOfdmDemodulator` accepts the same `{ onMessage, onFilePacket }` callback shape as `createDemodulator`
+- [x] End-to-end Vitest loopback: modulate a text message → demodulate → `onMessage` fires with the correct string
+- [x] Pilot-tone AFC corrects a synthetic ±5 Hz carrier offset without decode failure
+- [x] Passes under `npm test`
 
 ---
 
@@ -75,10 +76,10 @@ Implement an AudioWorklet processor that hosts the OFDM RX pipeline (`createOfdm
 
 ### Acceptance criteria
 
-- [ ] Toggling to OFDM mode starts the AudioWorklet; Bell 202 mode still uses ScriptProcessor
-- [ ] `sendMsg` sends a message over OFDM loopback (speaker → mic in the same browser tab) and it appears in the chat log
-- [ ] No audio glitches or dropout warnings in the browser console under normal load
-- [ ] AudioWorklet module is a separate file, bundled by Rollup into `dist/index.html`
+- [x] Toggling to OFDM mode starts the AudioWorklet; Bell 202 mode still uses ScriptProcessor
+- [x] `sendMsg` sends a message over OFDM loopback (speaker → mic in the same browser tab) and it appears in the chat log
+- [x] No audio glitches or dropout warnings in the browser console under normal load
+- [x] AudioWorklet source inlined as Blob URL in `main.js` so the single-file `dist/index.html` works without a separate module URL
 
 ---
 
@@ -92,10 +93,10 @@ Port the FFT (radix-2, 1D) and Viterbi forward-pass to WGSL compute shaders. GPU
 
 ### Acceptance criteria
 
-- [ ] GPU FFT output matches CPU FFT output to within floating-point tolerance on a known test vector
-- [ ] GPU Viterbi decode matches CPU Viterbi decode on the same input
-- [ ] Active demodulator label shows `OFDM-GPU` / `OFDM-CPU` as appropriate
-- [ ] Graceful fallback to CPU when `navigator.gpu` is absent or adapter request fails
+- [x] GPU FFT output matches CPU FFT output to within floating-point tolerance on a known test vector
+- [x] GPU Viterbi decode matches CPU Viterbi decode on the same input
+- [x] Active demodulator label shows `OFDM-GPU` / `OFDM-CPU` as appropriate
+- [x] Graceful fallback to CPU when `navigator.gpu` is absent or adapter request fails
 
 ---
 
@@ -109,24 +110,27 @@ Add a modem-mode toggle (Bell202 / OFDM-HF) to the settings panel. Display activ
 
 ### Acceptance criteria
 
-- [ ] Mode toggle switches the active TX/RX pipeline without requiring a page reload
-- [ ] Status area shows current mode (`Bell202` / `OFDM-HF`), Eb/N₀ estimate, and pilot phase error
-- [ ] Switching mode while audio is running stops and restarts the audio graph cleanly
-- [ ] All new elements have `data-testid` attributes following existing conventions
+- [x] Mode toggle switches the active TX/RX pipeline without requiring a page reload
+- [x] Status area shows current mode (`Bell202` / `OFDM-HF`), Eb/N₀ estimate, and pilot phase error
+- [x] Switching mode while audio is running stops and restarts the audio graph cleanly
+- [x] All new elements have `data-testid` attributes following existing conventions
 
 ---
 
-## Phase 7: Persist Callsign to localStorage
+## Phase 7: Persist Settings to localStorage
 
-**User stories**: Returning users don't have to re-enter their callsign every session.
+**User stories**: Returning users don't have to re-enter their callsign, passphrase, or modem mode every session.
 
 ### What to build
 
-On page load, read `localStorage.getItem('callsign')` and pre-populate the callsign input. On every change to the callsign field, write the new value back to `localStorage`. No expiry — the value persists until the user clears it or changes it.
+On page load, read `localStorage` and pre-populate callsign, passphrase, and modem mode. On every change to any of these fields, write the new value back to `localStorage`. Clearing the passphrase field removes the key. No expiry — values persist until the user clears or changes them.
 
 ### Acceptance criteria
 
-- [ ] Callsign field is pre-populated from `localStorage` on page load if a saved value exists
-- [ ] Changing the callsign field updates `localStorage` immediately (on `input` event)
-- [ ] A fresh page load with no stored callsign shows the existing default (`NOCALL` or empty)
-- [ ] Works in both dev (`src/index.html`) and production (`dist/index.html`) builds
+- [x] Callsign field is pre-populated from `localStorage` on page load if a saved value exists
+- [x] Changing the callsign field updates `localStorage` immediately (on `input` event)
+- [x] Passphrase field is pre-populated from `localStorage` on page load
+- [x] Changing the passphrase field updates `localStorage`; clearing it removes the key
+- [x] Modem mode selector is restored from `localStorage` on page load
+- [x] Changing the modem mode selector saves the new value to `localStorage`
+- [x] Works in both dev (`src/index.html`) and production (`dist/index.html`) builds
