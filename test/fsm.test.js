@@ -65,8 +65,26 @@ describe('FSM — running', () => {
     expect(t(S.RUNNING, E.STOP).state).toBe(S.STOPPING);
   });
 
+  it('START_TX → tx', () => {
+    expect(t(S.RUNNING, E.START_TX).state).toBe(S.TX);
+  });
+
   it('unknown event is a no-op', () => {
     expect(t(S.RUNNING, E.START).state).toBe(S.RUNNING);
+  });
+});
+
+describe('FSM — tx', () => {
+  it('TX_DONE → running', () => {
+    expect(t(S.TX, E.TX_DONE).state).toBe(S.RUNNING);
+  });
+
+  it('STOP → stopping (emergency stop during TX)', () => {
+    expect(t(S.TX, E.STOP).state).toBe(S.STOPPING);
+  });
+
+  it('unknown event is a no-op', () => {
+    expect(t(S.TX, E.START).state).toBe(S.TX);
   });
 });
 
@@ -104,7 +122,7 @@ describe('FSM — error', () => {
 
 describe('isAudioActive', () => {
   it('true for active states', () => {
-    for (const s of [S.REQUESTING_MIC, S.INITIALIZING, S.RUNNING, S.STOPPING])
+    for (const s of [S.REQUESTING_MIC, S.INITIALIZING, S.RUNNING, S.TX, S.STOPPING])
       expect(isAudioActive(s)).toBe(true);
   });
 

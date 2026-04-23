@@ -8,7 +8,8 @@ import { compress, decompress } from './compress.js';
 import { deriveKey, encryptBytes as cryptoEncryptBytes, decryptBytes as cryptoDecryptBytes } from './crypto.js';
 import { GpuDemodulator, initWebGpu, getSharedGpuDevice } from './gpu.js';
 import { addChat as addChatFn, populateMicList as populateMicListFn } from './ui.js';
-import { ofdmEncodeFrame } from './ofdm.js';
+import { ofdmEncodeFrame, ofdmEncodeFrameRaw } from './ofdm.js';
+import { encodePacket, decodePacket, CHUNK_SIZE } from './packet.js';
 import { createOfdmDemodulator } from './ofdm-demodulate.js';
 import { initGpuDft } from './ofdm-gpu.js';
 import { S, E, transition, isAudioActive } from './fsm.js';
@@ -172,21 +173,27 @@ async function sendMsg() {
   const msgEl = document.getElementById('message');
   const msg   = msgEl.value.trim();
   if (!msg) return;
-  if (!callsign)     { alert('Enter callsign first'); return; }
-  if (!audioContext) { alert('Click "Start Audio" first'); return; }
+  if (!callsign)              { alert('Enter callsign first'); return; }
+  if (fsmState !== S.RUNNING) { alert('Click "Start Audio" first'); return; }
   msgEl.value = '';
-  let audioData;
-  if (fsmContext.mode === 'ofdm') {
-    audioData = ofdmEncodeFrame(`${callsign}>${await encryptMsg(msg)}`);
-  } else {
-    const frameBytes = buildFrame(`${callsign}>${await encryptMsg(msg)}`, 'ALL', callsign);
-    audioData = modulate(frameBytes);
+  dispatch({ type: E.START_TX });
+  try {
+    let audioData;
+    if (fsmContext.mode === 'ofdm') {
+      audioData = ofdmEncodeFrame(`${callsign}>${await encryptMsg(msg)}`);
+    } else {
+      const frameBytes = buildFrame(`${callsign}>${await encryptMsg(msg)}`, 'ALL', callsign);
+      audioData = modulate(frameBytes);
+    }
+    const buf = audioContext.createBuffer(1, audioData.length, SAMPLE_RATE);
+    buf.getChannelData(0).set(audioData);
+    const src = audioContext.createBufferSource();
+    src.buffer = buf; src.connect(audioContext.destination);
+    await new Promise(resolve => { src.onended = resolve; src.start(); });
+    addChat(`TX ${callsign}: ${msg}`, 'tx');
+  } finally {
+    dispatch({ type: E.TX_DONE });
   }
-  const buf = audioContext.createBuffer(1, audioData.length, SAMPLE_RATE);
-  buf.getChannelData(0).set(audioData);
-  const src = audioContext.createBufferSource();
-  src.buffer = buf; src.connect(audioContext.destination); src.start();
-  addChat(`TX ${callsign}: ${msg}`, 'tx');
 }
 
 async function receiveMsg(raw) {
@@ -208,73 +215,69 @@ function playFrame(frameBytes) {
   });
 }
 
+function playOfdmFrame(bytes) {
+  return new Promise(resolve => {
+    const audioData = ofdmEncodeFrameRaw(bytes);
+    const buf = audioContext.createBuffer(1, audioData.length, SAMPLE_RATE);
+    buf.getChannelData(0).set(audioData);
+    const src = audioContext.createBufferSource();
+    src.buffer = buf; src.connect(audioContext.destination);
+    src.onended = resolve; src.start();
+  });
+}
+
 async function sendFile() {
   const fileInput = document.getElementById('fileInput');
   const file = fileInput.files[0];
   if (!file) return;
-  if (!callsign)     { alert('Enter callsign first'); return; }
-  if (!audioContext) { alert('Click "Start Audio" first'); return; }
+  if (!callsign)              { alert('Enter callsign first'); return; }
+  if (fsmState !== S.RUNNING) { alert('Click "Start Audio" first'); return; }
   fileInput.value = '';
 
-  await ensureCryptoKey();
+  dispatch({ type: E.START_TX });
+  try {
+    await ensureCryptoKey();
 
-  addChat(`TX FILE ${file.name} — ${file.size} B, compressing…`, 'file');
-  const raw        = new Uint8Array(await file.arrayBuffer());
-  const compressed = await compress(raw);
-  const ratio      = (raw.length / compressed.length).toFixed(1);
-  addChat(`TX FILE ${file.name} — compressed ${raw.length}→${compressed.length} B (${ratio}×)`, 'file');
+    addChat(`TX FILE ${file.name} — ${file.size} B, compressing…`, 'file');
+    const raw        = new Uint8Array(await file.arrayBuffer());
+    const compressed = await compress(raw);
+    const ratio      = (raw.length / compressed.length).toFixed(1);
+    addChat(`TX FILE ${file.name} — compressed ${raw.length}→${compressed.length} B (${ratio}×)`, 'file');
 
-  const xferId = crypto.getRandomValues(new Uint8Array(2));
-  const fname  = new TextEncoder().encode(file.name);
-  const total  = Math.max(1, Math.ceil(compressed.length / CHUNK_SIZE));
+    const xferId = crypto.getRandomValues(new Uint8Array(2));
+    const total  = Math.max(1, Math.ceil(compressed.length / CHUNK_SIZE));
 
-  for (let seq = 0; seq < total; seq++) {
-    const chunkData = compressed.slice(seq * CHUNK_SIZE, (seq + 1) * CHUNK_SIZE);
-    const isFirst   = seq === 0;
-    const hdrSize   = 8 + (isFirst ? 2 + fname.length : 0);
-    const payload   = new Uint8Array(hdrSize + chunkData.length);
-    let p = 0;
-    payload[p++] = 0xFE; payload[p++] = 0xFF;
-    payload[p++] = xferId[0]; payload[p++] = xferId[1];
-    payload[p++] = (seq >> 8) & 0xFF; payload[p++] = seq & 0xFF;
-    payload[p++] = (total >> 8) & 0xFF; payload[p++] = total & 0xFF;
-    if (isFirst) {
-      payload[p++] = (fname.length >> 8) & 0xFF;
-      payload[p++] = fname.length & 0xFF;
-      payload.set(fname, p); p += fname.length;
+    for (let seq = 0; seq < total; seq++) {
+      const data    = compressed.slice(seq * CHUNK_SIZE, (seq + 1) * CHUNK_SIZE);
+      const payload = encodePacket({ xferId, seq, total, filename: seq === 0 ? file.name : undefined, data });
+
+      const encrypted = await encryptBytesLocal(payload);
+      addChat(`TX FILE ${file.name} — fragment ${seq + 1}/${total} (${encrypted.length} B)`, 'file');
+
+      if (fsmContext.mode === 'ofdm') {
+        await playOfdmFrame(encrypted);
+      } else {
+        await playFrame(buildFrameRaw(encrypted, 'ALL', callsign));
+      }
     }
-    payload.set(chunkData, p);
-
-    const encrypted  = await encryptBytesLocal(payload);
-    const frameBytes = buildFrameRaw(encrypted, 'ALL', callsign);
-    addChat(`TX FILE ${file.name} — fragment ${seq + 1}/${total} (${encrypted.length} B)`, 'file');
-    await playFrame(frameBytes);
+    addChat(`TX FILE ${file.name} — all ${total} fragment(s) sent`, 'file');
+  } finally {
+    dispatch({ type: E.TX_DONE });
   }
-  addChat(`TX FILE ${file.name} — all ${total} fragment(s) sent`, 'file');
 }
 
 async function receiveFilePacket(rawData) {
-  const payload = await decryptBytesLocal(rawData);
-  if (!payload || payload.length < 8) return;
-  if (payload[0] !== 0xFE || payload[1] !== 0xFF) return;
+  const decrypted = await decryptBytesLocal(rawData);
+  const pkt = decodePacket(decrypted);
+  if (!pkt) return;
 
-  const xferKey = payload[2].toString(16).padStart(2, '0') +
-                  payload[3].toString(16).padStart(2, '0');
-  const seq     = (payload[4] << 8) | payload[5];
-  const total   = (payload[6] << 8) | payload[7];
-
-  if (!incomingTransfers.has(xferKey)) {
-    incomingTransfers.set(xferKey, { total, filename: null, fragments: new Array(total) });
+  const { xferId, seq, total, filename, data } = pkt;
+  if (!incomingTransfers.has(xferId)) {
+    incomingTransfers.set(xferId, { total, filename: null, fragments: new Array(total) });
   }
-  const xfer = incomingTransfers.get(xferKey);
-
-  let dataOffset = 8;
-  if (seq === 0) {
-    const fnameLen  = (payload[8] << 8) | payload[9];
-    xfer.filename   = new TextDecoder().decode(payload.slice(10, 10 + fnameLen));
-    dataOffset      = 10 + fnameLen;
-  }
-  xfer.fragments[seq] = payload.slice(dataOffset);
+  const xfer = incomingTransfers.get(xferId);
+  if (filename) xfer.filename = filename;
+  xfer.fragments[seq] = data;
 
   const received = xfer.fragments.filter(Boolean).length;
   addChat(`RX FILE ${xfer.filename || '?'} — fragment ${seq + 1}/${total} (${received}/${total})`, 'file');
@@ -294,7 +297,7 @@ async function receiveFilePacket(rawData) {
     URL.revokeObjectURL(url);
 
     addChat(`RX FILE ${xfer.filename} — complete! ${decompressed.length} B — saved ↓`, 'file');
-    incomingTransfers.delete(xferKey);
+    incomingTransfers.delete(xferId);
   }
 }
 
@@ -323,7 +326,7 @@ function renderState(state, context) {
 
   // Toggle button
   const busy = state === S.REQUESTING_MIC || state === S.INITIALIZING || state === S.STOPPING;
-  if (state === S.RUNNING) {
+  if (state === S.RUNNING || state === S.TX) {
     btn.textContent = '⏹ Stop Audio';
     btn.className   = 'btn btn-sm btn-outline-danger';
     btn.disabled    = false;
@@ -342,6 +345,12 @@ function renderState(state, context) {
   for (const id of ['modemMode', 'callsign', 'passphrase', 'micSelect'])
     document.getElementById(id).disabled = active;
 
+  // Disable chat controls while transmitting
+  const txing = state === S.TX;
+  document.getElementById('message').disabled = txing;
+  for (const tid of ['send-btn', 'send-file-btn'])
+    document.querySelector(`[data-testid="${tid}"]`).disabled = txing;
+
   // Status badge
   const statusMap = {
     [S.IDLE]:           ['Stopped',    'bg-warning text-dark'],
@@ -349,6 +358,7 @@ function renderState(state, context) {
     [S.MIC_DENIED]:     ['Mic denied', 'bg-danger text-light'],
     [S.INITIALIZING]:   ['Init…',      'bg-info text-dark'],
     [S.RUNNING]:        ['Running',    'bg-success text-light'],
+    [S.TX]:             ['TX…',        'bg-primary text-light'],
     [S.STOPPING]:       ['Stopping…',  'bg-warning text-dark'],
     [S.ERROR]:          ['Error',      'bg-danger text-light'],
   };
@@ -356,12 +366,12 @@ function renderState(state, context) {
   statusEl.textContent = label;
   statusEl.className   = `badge rounded-pill ${cls}`;
 
-  // OFDM graphs — only while running in OFDM mode
-  if (state !== S.RUNNING || context.mode !== 'ofdm') {
+  // OFDM graphs — only while running or tx in OFDM mode
+  if ((state !== S.RUNNING && state !== S.TX) || context.mode !== 'ofdm') {
     snrEl.classList.add('d-none');
     phaseEl.classList.add('d-none');
   }
-  if (state !== S.RUNNING) demodEl.textContent = '';
+  if (state !== S.RUNNING && state !== S.TX) demodEl.textContent = '';
 }
 
 async function handleStateEntry(state, context) {

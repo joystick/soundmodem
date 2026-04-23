@@ -7,6 +7,7 @@
 //   mic-denied      microphone permission denied (user can retry)
 //   initializing    AudioContext + GPU/worklet setup in progress
 //   running         audio active and demodulating
+//   tx              transmitting (speaker busy — RX suspended)
 //   stopping        teardown in progress
 //   error           unrecoverable hardware failure
 //
@@ -24,6 +25,7 @@ export const S = {
   MIC_DENIED:     'mic-denied',
   INITIALIZING:   'initializing',
   RUNNING:        'running',
+  TX:             'tx',
   STOPPING:       'stopping',
   ERROR:          'error',
 };
@@ -37,6 +39,8 @@ export const E = {
   STOP:           'STOP',
   STOPPED:        'STOPPED',
   MODE_CHANGE:    'MODE_CHANGE',
+  START_TX:       'START_TX',
+  TX_DONE:        'TX_DONE',
 };
 
 /**
@@ -76,6 +80,15 @@ export function transition(state, event, context = { mode: 'bell202', errorMessa
     case S.RUNNING:
       if (event.type === E.STOP)
         return { state: S.STOPPING, context };
+      if (event.type === E.START_TX)
+        return { state: S.TX, context };
+      break;
+
+    case S.TX:
+      if (event.type === E.TX_DONE)
+        return { state: S.RUNNING, context };
+      if (event.type === E.STOP)
+        return { state: S.STOPPING, context };
       break;
 
     case S.STOPPING:
@@ -98,5 +111,6 @@ export function isAudioActive(state) {
   return state === S.REQUESTING_MIC
       || state === S.INITIALIZING
       || state === S.RUNNING
+      || state === S.TX
       || state === S.STOPPING;
 }
