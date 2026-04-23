@@ -45,7 +45,7 @@ function applyPilotAfc(re, im) {
     sigPow   += re[b] * re[b];
     noisePow += im[b] * im[b];
   }
-  const snrDb = 10 * Math.log10(sigPow / Math.max(noisePow, 1e-20));
+  const snrDb = 10 * Math.log10(Math.max(sigPow, 1e-20) / Math.max(noisePow, 1e-20));
 
   return { phaseErrRad, snrDb };
 }
